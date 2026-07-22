@@ -33,9 +33,10 @@ clouddevbox new beta  --profile personal --type m7g.xlarge --disk 100 \
                       --plugins kauket,docker --autostop 10h
 clouddevbox list --profile personal
 clouddevbox ssh alpha --profile personal              # tailnet, via socks proxy
+clouddevbox ssh alpha --profile personal --show       # also print the raw ssh command
 clouddevbox ssh alpha --profile personal -- uname -a
 clouddevbox ssm alpha --profile personal              # Session Manager (break-glass)
-clouddevbox status alpha --profile personal           # bootstrap/autostop/tailnet state
+clouddevbox status alpha --profile personal           # provisioning/autostop/tailnet state
 clouddevbox stop alpha --profile personal             # EBS-only cost while stopped
 clouddevbox start alpha --profile personal
 clouddevbox autostop alpha 10h --profile personal     # or: 90m, off
@@ -74,6 +75,13 @@ autostop timer → amun `tailscale` → `tailscale up
 **amun core** (step-ca trust, ufw deny-in/allow-22, dotfiles, sshd
 hardening) → the `--plugins` list. Progress: `clouddevbox status <name>`,
 full log on the box at `/var/log/devbox-bootstrap.log`.
+
+`status` reports a provisioning state: **`provisioning`** while amun core +
+plugins are still installing (with the per-stage done/wanted lists on boxes
+created after 2026-07-22), **`running (fully provisioned: …)`** once every
+requested stage finished, or **`provisioning FAILED at: …`** with the step
+that broke. A box is SSH-able as soon as it joins the tailnet, several
+minutes before it reaches `running`.
 
 ## Bootstrap customization (`--plugins`)
 

@@ -13,6 +13,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -565,6 +566,8 @@ def cmd_ssh(args, session, account):
            "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
            "-o", "LogLevel=ERROR",
            "-i", SSH_KEY, "-l", VPS_USER, target, *args.command]
+    if getattr(args, "show", False):
+        print("+ " + shlex.join(cmd))
     rc = subprocess.run(cmd).returncode
     sys.exit(rc)
 
@@ -576,8 +579,11 @@ def cmd_ssm(args, session, account):
         raise CliError("session-manager-plugin not found on PATH; install it via gear:\n"
                        "  ~/.gear/com/session-manager-plugin/setup-darwin")
     i = _require_instance(session, args.name, states=["running"])
-    rc = subprocess.run(["aws", "ssm", "start-session", "--target", i["InstanceId"],
-                         "--region", REGION, "--profile", args.profile]).returncode
+    cmd = ["aws", "ssm", "start-session", "--target", i["InstanceId"],
+           "--region", REGION, "--profile", args.profile]
+    if getattr(args, "show", False):
+        print("+ " + shlex.join(cmd))
+    rc = subprocess.run(cmd).returncode
     sys.exit(rc)
 
 
@@ -595,13 +601,25 @@ def cmd_status(args, session, account):
         print(f"tailnet:   {node['ip']} - {'online' if node['online'] else 'offline'}")
     if state == "running":
         try:
+            # state vocabulary: "running" = fully provisioned (amun core +
+            # every requested plugin done); "provisioning" = bootstrap still
+            # working through them. Per-stage markers exist on boxes created
+            # after 2026-07-22; older boxes fall back to the overall marker.
             out = ssm_shell(session, i["InstanceId"], [
+                'wanted="$(cat /etc/clouddevbox/plugins 2>/dev/null)"',
+                'finished="$(tr "\\n" " " < /var/lib/clouddevbox/provisioned'
+                ' 2>/dev/null | sed "s/ $//")"',
                 "if test -f /var/lib/clouddevbox/bootstrap-complete; then "
-                "echo bootstrap: complete $(cat /var/lib/clouddevbox/bootstrap-complete); "
+                'echo "state: running (fully provisioned${wanted:+: $wanted}; '
+                'completed $(cat /var/lib/clouddevbox/bootstrap-complete))"; '
                 "elif test -f /var/lib/clouddevbox/bootstrap-failed; then "
-                "echo bootstrap: FAILED at: $(cat /var/lib/clouddevbox/bootstrap-failed); "
-                "else echo 'bootstrap: still running (~8 min total; amun+plugins finish"
-                " after the tailnet join; log: /var/log/devbox-bootstrap.log)'; fi",
+                'echo "state: provisioning FAILED at: '
+                '$(cat /var/lib/clouddevbox/bootstrap-failed)'
+                '${finished:+ (stages done: $finished)}"; '
+                "else "
+                'echo "state: provisioning${wanted:+ - wanted: $wanted}'
+                '${finished:+ - done: $finished} '
+                '(log: /var/log/devbox-bootstrap.log)"; fi',
                 "echo autostop: $(cat /etc/clouddevbox/autostop 2>/dev/null || echo unknown)",
                 "echo uptime: $(cut -d. -f1 /proc/uptime)s",
             ])
@@ -657,11 +675,15 @@ def build_parser():
     p = sub.add_parser("ssh", parents=[common], help="ssh over the tailnet (socks proxy)")
     p.add_argument("name")
     p.add_argument("--ssm", action="store_true", help="use SSM Session Manager instead")
+    p.add_argument("--show", action="store_true",
+                   help="print the underlying ssh command before connecting")
     p.add_argument("command", nargs="*", help="optional remote command")
     p.set_defaults(fn=cmd_ssh)
 
     p = sub.add_parser("ssm", parents=[common], help="SSM Session Manager shell")
     p.add_argument("name")
+    p.add_argument("--show", action="store_true",
+                   help="print the underlying aws command before connecting")
     p.set_defaults(fn=cmd_ssm)
 
     p = sub.add_parser("status", parents=[common], help="instance + tailnet + bootstrap state")
