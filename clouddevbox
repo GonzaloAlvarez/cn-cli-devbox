@@ -596,10 +596,12 @@ def cmd_status(args, session, account):
     if state == "running":
         try:
             out = ssm_shell(session, i["InstanceId"], [
-                "echo bootstrap: $(cat /var/lib/clouddevbox/bootstrap-complete 2>/dev/null "
-                "|| echo in-progress-or-failed)",
-                "test -f /var/lib/clouddevbox/bootstrap-failed && "
-                "echo bootstrap-FAILED: $(cat /var/lib/clouddevbox/bootstrap-failed) || true",
+                "if test -f /var/lib/clouddevbox/bootstrap-complete; then "
+                "echo bootstrap: complete $(cat /var/lib/clouddevbox/bootstrap-complete); "
+                "elif test -f /var/lib/clouddevbox/bootstrap-failed; then "
+                "echo bootstrap: FAILED at: $(cat /var/lib/clouddevbox/bootstrap-failed); "
+                "else echo 'bootstrap: still running (~8 min total; amun+plugins finish"
+                " after the tailnet join; log: /var/log/devbox-bootstrap.log)'; fi",
                 "echo autostop: $(cat /etc/clouddevbox/autostop 2>/dev/null || echo unknown)",
                 "echo uptime: $(cut -d. -f1 /proc/uptime)s",
             ])
