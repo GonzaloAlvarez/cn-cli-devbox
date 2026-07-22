@@ -411,8 +411,10 @@ def cmd_new(args, session, account):
         try:
             ssm.delete_parameter(Name=param)
             print(f"deleted SSM parameter {param}")
-        except Exception:
-            pass
+        except Exception as e:
+            # not fatal (keys are one-shot + 1h expiry, and destroy sweeps
+            # /devbox/<name>/*) but never fail silently
+            print(f"warning: could not delete {param}: {e}", file=sys.stderr)
 
     print(f"""
 devbox '{name}' is up
@@ -555,7 +557,11 @@ def cmd_ssh(args, session, account):
         raise CliError(f"socks proxy {SOCKS_HOST}:{SOCKS_PORT} is down; start cn-socksnode "
                        f"(~/dev/cn-socksnode/run.sh) or use: clouddevbox ssm {args.name}")
     target = info["ip"] or f"devbox-{args.name}.ts.gn.al"
+    # Ephemeral boxes recycle tailnet IPs, so pinning host keys would break
+    # every successor box; trusted-network no-verify combo per CLAUDE.md §4.2.
     cmd = ["ssh", "-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p",
+           "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
+           "-o", "LogLevel=ERROR",
            "-i", SSH_KEY, "-l", VPS_USER, target, *args.command]
     rc = subprocess.run(cmd).returncode
     sys.exit(rc)
