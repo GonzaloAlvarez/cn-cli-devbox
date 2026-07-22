@@ -106,23 +106,30 @@ def _field(d, *names, default=None):
 
 def parse_nodes(raw):
     """headscale `nodes list -o json` -> {hostname: {id, online, ip, last_seen}}
-    for tag:devbox nodes. Tolerates camelCase and snake_case field names."""
+    for tag:devbox nodes. Tolerates camelCase and snake_case field names;
+    v0.28 puts preauthkey tags under plain "tags" and encodes last_seen as a
+    protobuf {seconds, nanos} object."""
     nodes = json.loads(raw)
     if isinstance(nodes, dict):
         nodes = nodes.get("nodes") or nodes.get("machines") or []
     out = {}
     for n in nodes or []:
-        tags = _field(n, "forcedTags", "forced_tags", default=[]) or []
+        tags = set()
+        for key in ("tags", "forcedTags", "forced_tags", "validTags", "valid_tags"):
+            tags.update(n.get(key) or [])
         if "tag:devbox" not in tags:
             continue
         host = _field(n, "givenName", "given_name", "name", default="")
         ips = _field(n, "ipAddresses", "ip_addresses", default=[]) or []
         v4 = next((ip for ip in ips if ip.startswith("100.")), ips[0] if ips else None)
+        last_seen = _field(n, "lastSeen", "last_seen")
+        if isinstance(last_seen, dict):
+            last_seen = last_seen.get("seconds")
         out[host] = {
             "id": str(_field(n, "id", default="")),
             "online": bool(_field(n, "online", default=False)),
             "ip": v4,
-            "last_seen": _field(n, "lastSeen", "last_seen"),
+            "last_seen": last_seen,
         }
     return out
 

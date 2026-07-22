@@ -66,3 +66,25 @@ def test_parse_nodes_snake():
 def test_parse_nodes_wrapper_dict():
     wrapped = json.dumps({"nodes": json.loads(CAMEL)})
     assert set(cdb.parse_nodes(wrapped)) == {"devbox-tst1"}
+
+
+# Real headscale v0.28 shape (captured live 2026-07-22): snake_case,
+# preauthkey tags under plain "tags", last_seen as protobuf {seconds,nanos}.
+V028 = json.dumps([
+    {"id": 37, "ip_addresses": ["100.64.0.31", "fd7a:115c:a1e0::1f"],
+     "name": "devbox-tst1", "user": {"id": 2147455555, "name": "tagged-devices"},
+     "last_seen": {"seconds": 1784733548, "nanos": 861724657},
+     "given_name": "devbox-tst1", "online": True, "tags": ["tag:devbox"],
+     "pre_auth_key": {"acl_tags": ["tag:devbox"], "user": {"id": 2}}},
+    {"id": 1, "name": "infra-vps", "given_name": "infra-vps",
+     "ip_addresses": ["100.64.0.1"], "online": True, "tags": ["tag:infra"]},
+])
+
+
+def test_parse_nodes_v028_real_shape():
+    nodes = cdb.parse_nodes(V028)
+    assert set(nodes) == {"devbox-tst1"}
+    n = nodes["devbox-tst1"]
+    assert n["id"] == "37" and n["online"] is True
+    assert n["ip"] == "100.64.0.31"
+    assert n["last_seen"] == 1784733548
