@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""clouddevbox - manage cloud devboxes (cn-cdk-devbox stacks) in us-east-2.
+
+Boxes are identified by EC2 instance tags (devbox:name / devbox:managed-by);
+CloudFormation stacks Devbox-<name> own their lifecycle. Access is tailnet
+SSH (headscale at hs.gn.al) or SSM Session Manager - no open ports.
+
+Every run creates a throwaway venv (with boto3) under ./.clouddevbox in the
+current directory and removes it on exit, amun-style: nothing persists.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+REGION = "us-east-2"
+VPS_HOST = "hs.gn.al"
+VPS_USER = "gonzalo"
+SSH_KEY = str(Path.home() / ".ssh" / "gonzalo_main_private_key.pem")
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=15"]
+HS_CONTAINER = "cloudnet-headscale-1"
+HS_ADMIN_EMAIL = "gonzaloab@gmail.com"
+HS_USER_ID_FALLBACK = "2"
+SOCKS_HOST, SOCKS_PORT = "127.0.0.1", 1055
+CDK_REPO_URL = "https://github.com/GonzaloAlvarez/cn-cdk-devbox"
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,22}[a-z0-9]$")
+AUTOSTOP_RE = re.compile(r"^([0-9]+[hm]|off)$")
+KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+TYPE_RE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9]+$")
+PLUGIN_RE = re.compile(r"^[a-z0-9-]+$")
+
+LIVE_STATES = ["pending", "running", "stopping", "stopped", "shutting-down"]
+
+WORKDIR = Path.cwd() / ".clouddevbox"
+
+
+class CliError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# throwaway venv bootstrap (amun-style: fresh slate every run, cleanup on exit)
+# ---------------------------------------------------------------------------
+def _cleanup():
+    shutil.rmtree(WORKDIR, ignore_errors=True)
+
+
+def _bootstrap():
+    try:
+        import boto3  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("CLOUDDEVBOX_REEXEC"):
+        sys.exit("clouddevbox: boto3 still missing after venv bootstrap")
+    _cleanup()
+    venv = WORKDIR / "venv"
+    print("bootstrapping throwaway venv (boto3)...", file=sys.stderr)
+    try:
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        subprocess.run([str(venv / "bin" / "pip"), "install", "--quiet", "boto3"], check=True)
+    except BaseException:
+        _cleanup()
+        raise
+    env = dict(os.environ, CLOUDDEVBOX_REEXEC="1")
+    os.execve(str(venv / "bin" / "python"),
+              [str(venv / "bin" / "python"), os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+# ---------------------------------------------------------------------------
+# headscale over VPS ssh
+# ---------------------------------------------------------------------------
+def vps_run(cmd, timeout=90):
+    try:
+        p = subprocess.run(["ssh", *SSH_OPTS, "-i", SSH_KEY, "-l", VPS_USER, VPS_HOST, cmd],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise CliError(f"ssh to {VPS_HOST} timed out running: {cmd}")
+    if p.returncode != 0:
+        raise CliError(f"command on {VPS_HOST} failed: {cmd}\n{p.stderr.strip() or p.stdout.strip()}")
+    return p.stdout
+
+
+def headscale(args, timeout=90):
+    return vps_run(f"docker exec {HS_CONTAINER} headscale {args}", timeout)
+
+
+def _field(d, *names, default=None):
+    for n in names:
+        if isinstance(d, dict) and d.get(n) is not None:
+            return d[n]
+    return default
+
+
+def parse_nodes(raw):
+    """headscale `nodes list -o json` -> {hostname: {id, online, ip, last_seen}}
+    for tag:devbox nodes. Tolerates camelCase and snake_case field names."""
+    nodes = json.loads(raw)
+    if isinstance(nodes, dict):
+        nodes = nodes.get("nodes") or nodes.get("machines") or []
+    out = {}
+    for n in nodes or []:
+        tags = _field(n, "forcedTags", "forced_tags", default=[]) or []
+        if "tag:devbox" not in tags:
+            continue
+        host = _field(n, "givenName", "given_name", "name", default="")
+        ips = _field(n, "ipAddresses", "ip_addresses", default=[]) or []
+        v4 = next((ip for ip in ips if ip.startswith("100.")), ips[0] if ips else None)
+        out[host] = {
+            "id": str(_field(n, "id", default="")),
+            "online": bool(_field(n, "online", default=False)),
+            "ip": v4,
+            "last_seen": _field(n, "lastSeen", "last_seen"),
+        }
+    return out
+
+
+def hs_nodes():
+    """Returns the devbox node map, or None when the tailnet control plane
+    is unreachable (callers degrade gracefully)."""
+    try:
+        return parse_nodes(headscale("nodes list -o json"))
+    except (CliError, json.JSONDecodeError):
+        return None
+
+
+def hs_user_id():
+    try:
+        users = json.loads(headscale("users list -o json"))
+        for u in users or []:
+            if _field(u, "email", default="") == HS_ADMIN_EMAIL:
+                return str(_field(u, "id"))
+    except (CliError, json.JSONDecodeError):
+        pass
+    return HS_USER_ID_FALLBACK
+
+
+def hs_mint_key():
+    out = headscale(f"preauthkeys create --user {hs_user_id()} --tags tag:devbox --expiration 1h")
+    for line in reversed(out.strip().splitlines()):
+        line = line.strip()
+        if KEY_RE.match(line):
+            return line
+    raise CliError(f"could not parse a preauth key out of headscale output:\n{out}")
+
+
+def hs_delete_node(node_id):
+    headscale(f"nodes delete --identifier {node_id} --force")
+
+
+# ---------------------------------------------------------------------------
+# AWS session / EC2 helpers
+# ---------------------------------------------------------------------------
+def make_session(profile):
+    import boto3
+    import botocore.exceptions as bex
+    sso_errors = tuple(getattr(bex, n) for n in
+                       ("SSOTokenLoadError", "TokenRetrievalError",
+                        "UnauthorizedSSOTokenError", "SSOError")
+                       if hasattr(bex, n))
+    try:
+        session = boto3.Session(profile_name=profile, region_name=REGION)
+        account = session.client("sts").get_caller_identity()["Account"]
+        return session, account
+    except bex.ProfileNotFound:
+        raise CliError(f"AWS profile '{profile}' not found in ~/.aws/config or ~/.aws/credentials")
+    except sso_errors:
+        raise CliError(f"SSO credentials for '{profile}' are missing or expired; run:\n"
+                       f"  aws sso login --profile {profile}")
+    except bex.NoCredentialsError:
+        raise CliError(f"no credentials available for profile '{profile}'")
+    except bex.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if "Expired" in code or code in ("InvalidClientTokenId", "AccessDenied"):
+            raise CliError(f"credentials for '{profile}' were rejected ({code}); if this is an "
+                           f"SSO profile, run: aws sso login --profile {profile}")
+        raise
+
+
+def find_instance(ec2, name, states=None):
+    r = ec2.describe_instances(Filters=[
+        {"Name": "tag:devbox:name", "Values": [name]},
+        {"Name": "tag:devbox:managed-by", "Values": ["clouddevbox"]},
+        {"Name": "instance-state-name", "Values": states or LIVE_STATES},
+    ])
+    for res in r["Reservations"]:
+        for i in res["Instances"]:
+            return i
+    return None
+
+
+def all_instances(ec2):
+    r = ec2.describe_instances(Filters=[
+        {"Name": "tag:devbox:managed-by", "Values": ["clouddevbox"]},
+        {"Name": "instance-state-name", "Values": LIVE_STATES},
+    ])
+    out = []
+    for res in r["Reservations"]:
+        out.extend(res["Instances"])
+    return out
+
+
+def instance_tag(instance, key):
+    for t in instance.get("Tags", []):
+        if t["Key"] == key:
+            return t["Value"]
+    return None
+
+
+def stack_status(cfn, name):
+    import botocore.exceptions as bex
+    try:
+        stacks = cfn.describe_stacks(StackName=f"Devbox-{name}")["Stacks"]
+        return stacks[0]["StackStatus"], stacks[0]["StackId"], stacks[0]
+    except bex.ClientError as e:
+        if "does not exist" in str(e):
+            return None, None, None
+        raise
+
+
+def stack_output(stack, key):
+    for o in stack.get("Outputs", []):
+        if o["OutputKey"] == key:
+            return o["OutputValue"]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# cdk toolchain (ephemeral, inside the cn-cdk-devbox checkout)
+# ---------------------------------------------------------------------------
+def resolve_cdk_repo():
+    override = os.environ.get("CLOUDDEVBOX_CDK_REPO")
+    if override:
+        p = Path(override).expanduser()
+        if not (p / "cdk.json").exists():
+            raise CliError(f"CLOUDDEVBOX_CDK_REPO={override} is not a cn-cdk-devbox checkout")
+        return p
+    p = Path.home() / "dev" / "cn-cdk-devbox"
+    if (p / "cdk.json").exists():
+        return p
+    clone = WORKDIR / "cn-cdk-devbox"
+    if not (clone / "cdk.json").exists():
+        print(f"cloning {CDK_REPO_URL} (no local checkout found)...")
+        WORKDIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "--quiet", "--depth", "1", CDK_REPO_URL, str(clone)],
+                       check=True)
+    return clone
+
+
+def cdk_deploy(repo, profile, account, stacks, context):
+    if not shutil.which("node"):
+        raise CliError("node not found on PATH (the CDK needs it); install via asdf/brew")
+    base_python = shutil.which("python3") or sys.executable
+    venv, npm = repo / ".venv", repo / ".npm"
+    env = dict(os.environ, AWS_PROFILE=profile, AWS_ACCOUNT_ID=account)
+    env["PATH"] = f"{venv}/bin:" + env.get("PATH", "")
+    try:
+        print("preparing cdk toolchain (throwaway .venv/.npm in the checkout)...")
+        subprocess.run([base_python, "-m", "venv", str(venv)], check=True)
+        subprocess.run([str(venv / "bin" / "pip"), "install", "--quiet", "-r",
+                        str(repo / "requirements.txt")], check=True)
+        subprocess.run(["npm", "install", "--prefix", str(npm), "--silent", "aws-cdk"],
+                       cwd=repo, check=True)
+        cdk_bin = npm / "node_modules" / ".bin" / "cdk"
+        ctx = [a for k, v in context.items() for a in ("-c", f"{k}={v}")]
+        cmd = [str(cdk_bin), "deploy", *stacks, *ctx, "--require-approval", "never"]
+        print("+", " ".join(cmd))
+        rc = subprocess.run(cmd, cwd=repo, env=env).returncode
+        if rc != 0:
+            raise CliError(f"cdk deploy failed (rc={rc}); if the stack is stuck half-created, "
+                           f"run: clouddevbox destroy {context.get('box')} --profile {profile}")
+    finally:
+        shutil.rmtree(venv, ignore_errors=True)
+        shutil.rmtree(npm, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# waits
+# ---------------------------------------------------------------------------
+def wait_ssm_online(session, iid, timeout=900):
+    ssm = session.client("ssm")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = ssm.describe_instance_information(
+            Filters=[{"Key": "InstanceIds", "Values": [iid]}])
+        infos = r.get("InstanceInformationList", [])
+        if infos and infos[0].get("PingStatus") == "Online":
+            return
+        time.sleep(10)
+    raise CliError(f"instance {iid} never registered with SSM (waited {timeout}s)")
+
+
+def wait_tailnet_online(name, timeout=600, want_online=True):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        nodes = hs_nodes() or {}
+        info = nodes.get(f"devbox-{name}")
+        if info and info["online"] == want_online:
+            return info
+        time.sleep(15)
+    raise CliError(f"devbox-{name} did not appear {'online' if want_online else 'offline'} "
+                   f"on the tailnet (waited {timeout}s)")
+
+
+def ssm_shell(session, iid, commands, timeout=90):
+    """Run a short root shell script on the box via SSM; returns stdout."""
+    ssm = session.client("ssm")
+    cmd = ssm.send_command(InstanceIds=[iid], DocumentName="AWS-RunShellScript",
+                           Parameters={"commands": commands})
+    cid = cmd["Command"]["CommandId"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        inv = ssm.get_command_invocation(CommandId=cid, InstanceId=iid)
+        if inv["Status"] in ("Success", "Failed", "Cancelled", "TimedOut"):
+            if inv["Status"] != "Success":
+                raise CliError(f"ssm command {inv['Status']}: {inv.get('StandardErrorContent', '')[:400]}")
+            return inv.get("StandardOutputContent", "")
+    raise CliError("ssm command did not finish in time")
+
+
+def humanize_age(launch_time):
+    delta = datetime.datetime.now(datetime.timezone.utc) - launch_time
+    secs = int(delta.total_seconds())
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+def cmd_new(args, session, account):
+    name = args.name
+    if not NAME_RE.match(name) or name == "base":
+        raise CliError(f"invalid name '{name}': lowercase alphanumeric + dashes, 2-24 chars")
+    if not TYPE_RE.match(args.type):
+        raise CliError(f"invalid instance type '{args.type}'")
+    if not 8 <= args.disk <= 2000:
+        raise CliError(f"invalid disk size {args.disk} GiB (8-2000)")
+    if not AUTOSTOP_RE.match(args.autostop):
+        raise CliError(f"invalid autostop '{args.autostop}': use <N>h, <N>m or off")
+    plugins = [p for p in args.plugins.split(",") if p]
+    for p in plugins:
+        if not PLUGIN_RE.match(p):
+            raise CliError(f"invalid plugin name '{p}' (maps to the amun-<plugin> repo)")
+
+    ec2 = session.client("ec2")
+    cfn = session.client("cloudformation")
+
+    if find_instance(ec2, name):
+        raise CliError(f"a devbox named '{name}' already exists (see: clouddevbox list)")
+    status, _, _ = stack_status(cfn, name)
+    if status and status != "DELETE_COMPLETE":
+        raise CliError(f"CloudFormation stack Devbox-{name} already exists ({status}); "
+                       f"destroy it first")
+    nodes = hs_nodes()
+    if nodes is None:
+        raise CliError(f"cannot reach headscale via {VPS_HOST} - needed to mint the tailnet key")
+    if f"devbox-{name}" in nodes:
+        raise CliError(f"stale headscale node 'devbox-{name}' exists; remove it first: "
+                       f"ssh {VPS_HOST} 'docker exec {HS_CONTAINER} headscale nodes delete "
+                       f"--identifier {nodes[f'devbox-{name}']['id']} --force'")
+
+    repo = resolve_cdk_repo()
+
+    print(f"minting one-shot headscale preauth key (tag:devbox, 1h expiry)...")
+    key = hs_mint_key()
+    ssm = session.client("ssm")
+    param = f"/devbox/{name}/ts-authkey"
+    ssm.put_parameter(Name=param, Value=key, Type="SecureString", Overwrite=True)
+    print(f"staged key at SSM parameter {param}")
+
+    try:
+        cdk_deploy(repo, args.profile, account, ["DevboxBase", f"Devbox-{name}"], {
+            "box": name, "type": args.type, "disk": str(args.disk),
+            "plugins": ",".join(plugins), "autostop": args.autostop,
+        })
+        _, _, stack = stack_status(cfn, name)
+        iid = stack_output(stack, "instanceid")
+        if not iid:
+            raise CliError(f"stack Devbox-{name} has no instanceid output")
+        print(f"instance {iid} created; waiting for it to run...")
+        ec2.get_waiter("instance_running").wait(InstanceIds=[iid])
+        print("waiting for SSM agent registration (break-glass access)...")
+        wait_ssm_online(session, iid)
+        print("waiting for the box to join the tailnet...")
+        info = wait_tailnet_online(name)
+    finally:
+        try:
+            ssm.delete_parameter(Name=param)
+            print(f"deleted SSM parameter {param}")
+        except Exception:
+            pass
+
+    print(f"""
+devbox '{name}' is up
+  tailnet ip: {info['ip']}   (MagicDNS: devbox-{name}.ts.gn.al)
+  ssh:        clouddevbox ssh {name} --profile {args.profile}
+              (socks proxy 127.0.0.1:1055 must be up: ~/dev/cn-socksnode/run.sh)
+  ssm:        clouddevbox ssm {name} --profile {args.profile}
+              (lands as ssm-user; sudo su - gonzalo)
+  autostop:   {args.autostop} after each boot (clouddevbox autostop {name} 10h|off)
+  note:       amun bootstrap keeps running ~5-8 min after the tailnet join;
+              clouddevbox status {name} --profile {args.profile} shows completion""")
+
+
+def cmd_list(args, session, account):
+    ec2 = session.client("ec2")
+    instances = all_instances(ec2)
+    nodes = hs_nodes()
+    rows = []
+    for i in instances:
+        name = instance_tag(i, "devbox:name") or "?"
+        node = (nodes or {}).get(f"devbox-{name}")
+        if nodes is None:
+            tailnet = "?"
+        elif node is None:
+            tailnet = "-"
+        else:
+            tailnet = (node["ip"] or "?") + ("" if node["online"] else " (offline)")
+        rows.append((name, i["State"]["Name"], i["InstanceType"], tailnet,
+                     humanize_age(i["LaunchTime"])))
+    rows.sort()
+    header = ("NAME", "STATE", "TYPE", "TAILNET-IP", "AGE")
+    widths = [max(len(str(r[c])) for r in [header, *rows]) for c in range(len(header))]
+    for r in [header, *rows]:
+        print("  ".join(str(v).ljust(widths[c]) for c, v in enumerate(r)))
+    if not rows:
+        print("(no devboxes)")
+
+
+def _require_instance(session, name, states=None):
+    i = find_instance(session.client("ec2"), name, states)
+    if not i:
+        raise CliError(f"no devbox named '{name}' (see: clouddevbox list)")
+    return i
+
+
+def cmd_start(args, session, account):
+    i = _require_instance(session, args.name)
+    if i["State"]["Name"] == "running":
+        print(f"devbox '{args.name}' is already running")
+        return
+    ec2 = session.client("ec2")
+    ec2.start_instances(InstanceIds=[i["InstanceId"]])
+    print(f"starting {i['InstanceId']}...")
+    ec2.get_waiter("instance_running").wait(InstanceIds=[i["InstanceId"]])
+    print("instance running; waiting for the tailnet...")
+    wait_tailnet_online(args.name, timeout=300)
+    print(f"devbox '{args.name}' is up (autostop clock restarted)")
+
+
+def cmd_stop(args, session, account):
+    i = _require_instance(session, args.name)
+    if i["State"]["Name"] == "stopped":
+        print(f"devbox '{args.name}' is already stopped")
+        return
+    ec2 = session.client("ec2")
+    ec2.stop_instances(InstanceIds=[i["InstanceId"]])
+    print(f"stopping {i['InstanceId']}...")
+    ec2.get_waiter("instance_stopped").wait(InstanceIds=[i["InstanceId"]])
+    print(f"devbox '{args.name}' stopped (costs only its EBS volume now)")
+
+
+def cmd_autostop(args, session, account):
+    if not AUTOSTOP_RE.match(args.value):
+        raise CliError(f"invalid autostop '{args.value}': use <N>h, <N>m or off "
+                       f"(e.g. 6h, 10h, 90m)")
+    i = _require_instance(session, args.name)
+    if i["State"]["Name"] != "running":
+        raise CliError(f"devbox '{args.name}' is {i['State']['Name']}; autostop can only be "
+                       f"changed while it runs (the value persists across stops)")
+    out = ssm_shell(session, i["InstanceId"], [
+        f"echo '{args.value}' > /etc/clouddevbox/autostop",
+        "cat /etc/clouddevbox/autostop",
+    ])
+    print(f"autostop for '{args.name}' set to: {out.strip()}"
+          + ("" if args.value == "off" else " (measured from each boot, checked every 5 min)"))
+
+
+def cmd_destroy(args, session, account):
+    cfn = session.client("cloudformation")
+    status, stack_id, _ = stack_status(cfn, args.name)
+    nodes = hs_nodes() or {}
+    node = nodes.get(f"devbox-{args.name}")
+
+    if not status and not node:
+        print(f"nothing to destroy for '{args.name}' (no stack, no tailnet node); "
+              f"sweeping leftover SSM parameters")
+        args.yes = True
+    if not args.yes:
+        reply = input(f"destroy devbox '{args.name}' (stack Devbox-{args.name}, instance + "
+                      f"volume + tailnet node)? [y/N] ")
+        if reply.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return
+
+    if status:
+        print(f"deleting CloudFormation stack Devbox-{args.name} ({status})...")
+        cfn.delete_stack(StackName=stack_id)
+        cfn.get_waiter("stack_delete_complete").wait(StackName=stack_id)
+        print("stack deleted")
+    if node:
+        print(f"removing headscale node devbox-{args.name} (id {node['id']})...")
+        try:
+            hs_delete_node(node["id"])
+        except CliError as e:
+            print(f"warning: could not delete the headscale node - remove it manually:\n{e}")
+    ssm = session.client("ssm")
+    params = ssm.get_parameters_by_path(Path=f"/devbox/{args.name}", Recursive=True)
+    names = [p["Name"] for p in params.get("Parameters", [])]
+    if names:
+        ssm.delete_parameters(Names=names)
+        print(f"deleted SSM parameters: {', '.join(names)}")
+    print(f"devbox '{args.name}' destroyed")
+
+
+def cmd_ssh(args, session, account):
+    if args.ssm:
+        return cmd_ssm(args, session, account)
+    nodes = hs_nodes()
+    info = (nodes or {}).get(f"devbox-{args.name}")
+    if not info:
+        raise CliError(f"devbox-{args.name} is not on the tailnet"
+                       + ("" if nodes is not None else f" (headscale unreachable)")
+                       + "; try: clouddevbox ssh --ssm")
+    if not info["online"]:
+        raise CliError(f"devbox-{args.name} is offline (stopped?); "
+                       f"clouddevbox start {args.name} --profile {args.profile}")
+    try:
+        socket.create_connection((SOCKS_HOST, SOCKS_PORT), 2).close()
+    except OSError:
+        raise CliError(f"socks proxy {SOCKS_HOST}:{SOCKS_PORT} is down; start cn-socksnode "
+                       f"(~/dev/cn-socksnode/run.sh) or use: clouddevbox ssm {args.name}")
+    target = info["ip"] or f"devbox-{args.name}.ts.gn.al"
+    cmd = ["ssh", "-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p",
+           "-i", SSH_KEY, "-l", VPS_USER, target, *args.command]
+    rc = subprocess.run(cmd).returncode
+    sys.exit(rc)
+
+
+def cmd_ssm(args, session, account):
+    if not shutil.which("aws"):
+        raise CliError("aws CLI not found on PATH")
+    if not shutil.which("session-manager-plugin"):
+        raise CliError("session-manager-plugin not found on PATH; install it via gear:\n"
+                       "  ~/.gear/com/session-manager-plugin/setup-darwin")
+    i = _require_instance(session, args.name, states=["running"])
+    rc = subprocess.run(["aws", "ssm", "start-session", "--target", i["InstanceId"],
+                         "--region", REGION, "--profile", args.profile]).returncode
+    sys.exit(rc)
+
+
+def cmd_status(args, session, account):
+    i = _require_instance(session, args.name)
+    state = i["State"]["Name"]
+    print(f"instance:  {i['InstanceId']} ({i['InstanceType']}) - {state}")
+    nodes = hs_nodes()
+    node = (nodes or {}).get(f"devbox-{args.name}")
+    if nodes is None:
+        print("tailnet:   ? (headscale unreachable)")
+    elif node is None:
+        print("tailnet:   not registered")
+    else:
+        print(f"tailnet:   {node['ip']} - {'online' if node['online'] else 'offline'}")
+    if state == "running":
+        try:
+            out = ssm_shell(session, i["InstanceId"], [
+                "echo bootstrap: $(cat /var/lib/clouddevbox/bootstrap-complete 2>/dev/null "
+                "|| echo in-progress-or-failed)",
+                "test -f /var/lib/clouddevbox/bootstrap-failed && "
+                "echo bootstrap-FAILED: $(cat /var/lib/clouddevbox/bootstrap-failed) || true",
+                "echo autostop: $(cat /etc/clouddevbox/autostop 2>/dev/null || echo unknown)",
+                "echo uptime: $(cut -d. -f1 /proc/uptime)s",
+            ])
+            for line in out.strip().splitlines():
+                print(f"box:       {line}")
+        except CliError as e:
+            print(f"box:       (ssm query failed: {e})")
+
+
+# ---------------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="clouddevbox",
+        description="Manage cloud devboxes (no open ports; tailnet SSH + SSM only; "
+                    f"region {REGION}).")
+    parser.add_argument("--version", action="version", version=f"clouddevbox {VERSION}")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--profile", required=True,
+                        help="AWS profile (mandatory; account is derived via STS)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("new", parents=[common], help="create a devbox")
+    p.add_argument("name")
+    p.add_argument("--type", default="m7g.large", help="EC2 instance type (default m7g.large)")
+    p.add_argument("--disk", type=int, default=50, help="root gp3 GiB (default 50)")
+    p.add_argument("--plugins", default="kauket",
+                   help="comma-separated amun plugins after core (default: kauket)")
+    p.add_argument("--autostop", default="6h", help="self-stop after this uptime (default 6h; off)")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("list", parents=[common], help="list devboxes")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("start", parents=[common], help="start a stopped devbox")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("stop", parents=[common], help="stop a devbox (EBS-only cost)")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("autostop", parents=[common],
+                       help="set the self-stop timeout (e.g. 10h, 90m, off)")
+    p.add_argument("name")
+    p.add_argument("value")
+    p.set_defaults(fn=cmd_autostop)
+
+    p = sub.add_parser("destroy", parents=[common], help="destroy a devbox completely")
+    p.add_argument("name")
+    p.add_argument("--yes", action="store_true", help="skip confirmation")
+    p.set_defaults(fn=cmd_destroy)
+
+    p = sub.add_parser("ssh", parents=[common], help="ssh over the tailnet (socks proxy)")
+    p.add_argument("name")
+    p.add_argument("--ssm", action="store_true", help="use SSM Session Manager instead")
+    p.add_argument("command", nargs="*", help="optional remote command")
+    p.set_defaults(fn=cmd_ssh)
+
+    p = sub.add_parser("ssm", parents=[common], help="SSM Session Manager shell")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_ssm)
+
+    p = sub.add_parser("status", parents=[common], help="instance + tailnet + bootstrap state")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_status)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    session, account = make_session(args.profile)
+    args.fn(args, session, account)
+    return 0
+
+
+if __name__ == "__main__":
+    _bootstrap()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    try:
+        sys.exit(main())
+    except CliError as e:
+        print(f"clouddevbox: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+    finally:
+        _cleanup()
