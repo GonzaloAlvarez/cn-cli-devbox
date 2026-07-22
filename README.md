@@ -47,6 +47,16 @@ clouddevbox destroy alpha --profile personal          # stack + node + params, c
 on the CloudFormation stack `Devbox-<name>` (destroy uses the CFN API
 directly — no cdk toolchain needed).
 
+## Naming
+
+Every live devbox resolves as **`<name>.devbox.lab.gn.al`** on the tailnet
+(and via the socks proxy in default mode). The VPS CoreDNS serves a
+`devbox.lab.gn.al` zone that rewrites to the MagicDNS name
+`devbox-<name>.ts.gn.al` — stateless, so live boxes resolve and destroyed
+ones NXDOMAIN. Caveat: with cn-socksnode in `--exit-lan` mode, `lab.gn.al`
+split-DNS is bypassed (like every tailnet-only lab name) — `clouddevbox
+ssh` is immune (it connects by tailnet IP).
+
 ## What `new` actually does
 
 1. Mints a **one-shot headscale preauth key** (tag:devbox, 1 h expiry) via

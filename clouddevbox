@@ -418,7 +418,9 @@ def cmd_new(args, session, account):
 
     print(f"""
 devbox '{name}' is up
-  tailnet ip: {info['ip']}   (MagicDNS: devbox-{name}.ts.gn.al)
+  dns:        {name}.devbox.lab.gn.al -> {info['ip']}
+              (tailnet split-DNS; from socksnode --exit-lan mode names under
+              lab.gn.al don't resolve - use the IP or clouddevbox ssh)
   ssh:        clouddevbox ssh {name} --profile {args.profile}
               (socks proxy 127.0.0.1:1055 must be up: ~/dev/cn-socksnode/run.sh)
   ssm:        clouddevbox ssm {name} --profile {args.profile}
