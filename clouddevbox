@@ -339,6 +339,14 @@ def ssm_shell(session, iid, commands, timeout=90):
     raise CliError("ssm command did not finish in time")
 
 
+def _tcp_reachable(host, port, timeout):
+    try:
+        socket.create_connection((host, port), timeout).close()
+        return True
+    except OSError:
+        return False
+
+
 def humanize_age(launch_time):
     delta = datetime.datetime.now(datetime.timezone.utc) - launch_time
     secs = int(delta.total_seconds())
@@ -554,18 +562,26 @@ def cmd_ssh(args, session, account):
     if not info["online"]:
         raise CliError(f"devbox-{args.name} is offline (stopped?); "
                        f"clouddevbox start {args.name} --profile {args.profile}")
-    try:
-        socket.create_connection((SOCKS_HOST, SOCKS_PORT), 2).close()
-    except OSError:
-        raise CliError(f"socks proxy {SOCKS_HOST}:{SOCKS_PORT} is down; start cn-socksnode "
-                       f"(~/dev/cn-socksnode/run.sh) or use: clouddevbox ssm {args.name}")
     target = info["ip"] or f"devbox-{args.name}.ts.gn.al"
+    # Path selection: prefer the socks proxy (the Mac's only tailnet doorway,
+    # at home or away); fall back to a direct connection for machines with a
+    # native tailnet route (e.g. running this from one devbox to another).
     # Ephemeral boxes recycle tailnet IPs, so pinning host keys would break
     # every successor box; trusted-network no-verify combo per CLAUDE.md §4.2.
-    cmd = ["ssh", "-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p",
-           "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
-           "-o", "LogLevel=ERROR",
-           "-i", SSH_KEY, "-l", VPS_USER, target, *args.command]
+    base = ["ssh",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
+            "-o", "LogLevel=ERROR",
+            "-i", SSH_KEY, "-l", VPS_USER]
+    if _tcp_reachable(SOCKS_HOST, SOCKS_PORT, 1.5):
+        cmd = [*base, "-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p",
+               target, *args.command]
+    elif info["ip"] and _tcp_reachable(info["ip"], 22, 3):
+        cmd = [*base, target, *args.command]
+    else:
+        raise CliError(f"no path to devbox-{args.name}: socks proxy "
+                       f"{SOCKS_HOST}:{SOCKS_PORT} is down and {target}:22 is not "
+                       f"directly reachable; start cn-socksnode "
+                       f"(~/dev/cn-socksnode/run.sh) or use: clouddevbox ssm {args.name}")
     if getattr(args, "show", False):
         print("+ " + shlex.join(cmd))
     rc = subprocess.run(cmd).returncode

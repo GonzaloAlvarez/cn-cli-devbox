@@ -88,3 +88,58 @@ def test_parse_nodes_v028_real_shape():
     assert n["id"] == "37" and n["online"] is True
     assert n["ip"] == "100.64.0.31"
     assert n["last_seen"] == 1784733548
+
+
+class _Args:
+    ssm = False
+    show = False
+    name = "x"
+    profile = "p"
+    command = []
+
+
+def _ssh_path(reachable):
+    """Run cmd_ssh with stubbed probes; return the ssh argv it chose."""
+    saved = (cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run)
+    ran = []
+    try:
+        cdb.hs_nodes = lambda: {
+            "devbox-x": {"id": "1", "online": True, "ip": "100.64.0.99",
+                         "last_seen": None}}
+        cdb._tcp_reachable = lambda h, p, t: reachable.get((h, p), False)
+        cdb.subprocess.run = lambda cmd, **kw: type("R", (), {"returncode": 0})()
+        cdb.subprocess.run = (lambda cmd, **kw:
+                              (ran.append(cmd), type("R", (), {"returncode": 0})())[1])
+        try:
+            cdb.cmd_ssh(_Args(), None, None)
+        except SystemExit as e:
+            assert e.code == 0
+        return ran[0]
+    finally:
+        cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run = saved
+
+
+def test_ssh_prefers_proxy_when_up():
+    cmd = _ssh_path({(cdb.SOCKS_HOST, cdb.SOCKS_PORT): True})
+    assert any("ProxyCommand" in a for a in cmd)
+    assert cmd[-1] == "100.64.0.99"
+
+
+def test_ssh_falls_back_to_direct_route():
+    cmd = _ssh_path({("100.64.0.99", 22): True})
+    assert not any("ProxyCommand" in a for a in cmd)
+    assert cmd[-1] == "100.64.0.99"
+
+
+def test_ssh_errors_when_no_path():
+    import pytest
+    saved = (cdb.hs_nodes, cdb._tcp_reachable)
+    try:
+        cdb.hs_nodes = lambda: {
+            "devbox-x": {"id": "1", "online": True, "ip": "100.64.0.99",
+                         "last_seen": None}}
+        cdb._tcp_reachable = lambda h, p, t: False
+        with pytest.raises(cdb.CliError, match="no path"):
+            cdb.cmd_ssh(_Args(), None, None)
+    finally:
+        cdb.hs_nodes, cdb._tcp_reachable = saved
