@@ -19,12 +19,25 @@ creates a throwaway venv under `./.clouddevbox` in the current directory
 - `node` on PATH (asdf/brew) — only needed by `new` (runs `cdk deploy`).
 - `session-manager-plugin` on PATH for `ssm` — install via gear:
   `~/.gear/com/session-manager-plugin/setup-darwin` (or `setup-debian`).
-- Tailnet SSH needs `~/.ssh/gonzalo_main_private_key.pem` plus a path to the
-  tailnet: the cn-socksnode proxy on `127.0.0.1:1055`
-  (`~/dev/cn-socksnode/run.sh` — the Mac's only tailnet doorway, at home or
-  away), or a native tailnet route (e.g. running clouddevbox on one devbox
-  to reach another). `ssh` picks automatically: proxy when the port is up,
-  direct otherwise, and suggests `ssm` when neither exists.
+- The **MasterSSH private key**, resolved per run in this order (also needed
+  by `new`/`list`/`destroy`/`start`/`status`, which ssh to `hs.gn.al` for
+  headscale):
+  1. `CLOUDDEVBOX_SSH_KEY` env var, if set;
+  2. `~/.ssh/gonzalo_main_private_key.pem`, if present (the usual case);
+  3. the **kauket** secret `ssh.main_ssk_key` — fetched with
+     `kauket get --stdout` (`--no-sync` fast path, sync retry) into a `0700`
+     tmp dir (`0600` file) that is deleted on exit; nothing is installed
+     into `~/.ssh`. Requires a kauket client home at
+     `~/.config/kauket-operator-client` (or `$KAUKET_HOME`) granted the
+     `ssh` profile. One-time setup on a new laptop:
+     `KAUKET_HOME=~/.config/kauket-operator-client kauket enroll --request ssh`,
+     then `kauket approve` from the admin machine.
+- Tailnet SSH also needs a path to the tailnet: the cn-socksnode proxy on
+  `127.0.0.1:1055` (`~/dev/cn-socksnode/run.sh` — the Mac's only tailnet
+  doorway, at home or away), or a native tailnet route (e.g. running
+  clouddevbox on one devbox to reach another). `ssh` picks automatically:
+  proxy when the port is up, direct otherwise, and suggests `ssm` when
+  neither exists.
 - `new`/`destroy` talk to headscale over plain SSH to `hs.gn.al` (public).
 - A `cn-cdk-devbox` checkout at `~/dev/cn-cdk-devbox` (or set
   `CLOUDDEVBOX_CDK_REPO`); if neither exists, `new` clones it temporarily.

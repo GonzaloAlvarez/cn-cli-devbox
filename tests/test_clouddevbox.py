@@ -100,9 +100,11 @@ class _Args:
 
 def _ssh_path(reachable):
     """Run cmd_ssh with stubbed probes; return the ssh argv it chose."""
-    saved = (cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run)
+    saved = (cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run,
+             cdb._SSH_KEY_CACHE)
     ran = []
     try:
+        cdb._SSH_KEY_CACHE = "/fake/key.pem"
         cdb.hs_nodes = lambda: {
             "devbox-x": {"id": "1", "online": True, "ip": "100.64.0.99",
                          "last_seen": None}}
@@ -116,7 +118,8 @@ def _ssh_path(reachable):
             assert e.code == 0
         return ran[0]
     finally:
-        cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run = saved
+        (cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run,
+         cdb._SSH_KEY_CACHE) = saved
 
 
 def test_ssh_prefers_proxy_when_up():
@@ -143,3 +146,96 @@ def test_ssh_errors_when_no_path():
             cdb.cmd_ssh(_Args(), None, None)
     finally:
         cdb.hs_nodes, cdb._tcp_reachable = saved
+
+
+# ---------------------------------------------------------------------------
+# ssh key resolution: env override -> ~/.ssh -> kauket
+# ---------------------------------------------------------------------------
+def _reset_key_state(monkeypatch):
+    monkeypatch.setattr(cdb, "_SSH_KEY_CACHE", None)
+    monkeypatch.setattr(cdb, "_SSH_KEY_TMPDIR", None)
+    monkeypatch.delenv("CLOUDDEVBOX_SSH_KEY", raising=False)
+    monkeypatch.delenv("KAUKET_HOME", raising=False)
+
+
+def _fake_kauket(tmp_path, body):
+    exe = tmp_path / "kauket"
+    exe.write_text("#!/bin/sh\n" + body + "\n")
+    exe.chmod(0o755)
+    home = tmp_path / "kauket-home"
+    home.mkdir(exist_ok=True)
+    return str(exe), str(home)
+
+
+def _use_kauket(tmp_path, monkeypatch, body):
+    _reset_key_state(monkeypatch)
+    exe, home = _fake_kauket(tmp_path, body)
+    monkeypatch.setattr(cdb, "SSH_KEY_LOCAL", str(tmp_path / "absent.pem"))
+    monkeypatch.setattr(cdb, "KAUKET_CLIENT_HOME", home)
+    monkeypatch.setattr(cdb, "WORKDIR", tmp_path / "wd")
+    monkeypatch.setattr(cdb.shutil, "which",
+                        lambda n: exe if n == "kauket" else None)
+
+
+def test_ssh_key_env_override(tmp_path, monkeypatch):
+    _reset_key_state(monkeypatch)
+    key = tmp_path / "mykey.pem"
+    key.write_text("k")
+    monkeypatch.setenv("CLOUDDEVBOX_SSH_KEY", str(key))
+    assert cdb.ssh_key() == str(key)
+
+
+def test_ssh_key_env_override_missing(tmp_path, monkeypatch):
+    import pytest
+    _reset_key_state(monkeypatch)
+    monkeypatch.setenv("CLOUDDEVBOX_SSH_KEY", str(tmp_path / "nope.pem"))
+    with pytest.raises(cdb.CliError, match="not a file"):
+        cdb.ssh_key()
+
+
+def test_ssh_key_local_preferred_over_kauket(tmp_path, monkeypatch):
+    _reset_key_state(monkeypatch)
+    local = tmp_path / "local.pem"
+    local.write_text("k")
+    monkeypatch.setattr(cdb, "SSH_KEY_LOCAL", str(local))
+
+    def _no_kauket(_):
+        raise AssertionError("kauket consulted despite a local key")
+    monkeypatch.setattr(cdb.shutil, "which", _no_kauket)
+    assert cdb.ssh_key() == str(local)
+
+
+def test_ssh_key_kauket_fetch_tmp_and_cleanup(tmp_path, monkeypatch):
+    _use_kauket(tmp_path, monkeypatch, 'printf "FAKEKEY"')
+    path = Path(cdb.ssh_key())
+    assert path.read_bytes() == b"FAKEKEY"
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
+    assert cdb.ssh_key() == str(path)  # cached, no re-fetch
+    cdb._cleanup()
+    assert not path.exists() and not path.parent.exists()
+
+
+def test_ssh_key_kauket_sync_retry(tmp_path, monkeypatch):
+    _use_kauket(tmp_path, monkeypatch,
+                'for a in "$@"; do if [ "$a" = "--no-sync" ]; then '
+                'echo stale >&2; exit 5; fi; done\nprintf "SYNCEDKEY"')
+    assert Path(cdb.ssh_key()).read_bytes() == b"SYNCEDKEY"
+    cdb._cleanup()
+
+
+def test_ssh_key_kauket_not_granted_hint(tmp_path, monkeypatch):
+    import pytest
+    _use_kauket(tmp_path, monkeypatch,
+                'echo "error: secret ssh.main_ssk_key is not granted" >&2; exit 5')
+    with pytest.raises(cdb.CliError, match="enroll"):
+        cdb.ssh_key()
+
+
+def test_ssh_key_no_kauket_on_path(tmp_path, monkeypatch):
+    import pytest
+    _reset_key_state(monkeypatch)
+    monkeypatch.setattr(cdb, "SSH_KEY_LOCAL", str(tmp_path / "absent.pem"))
+    monkeypatch.setattr(cdb.shutil, "which", lambda n: None)
+    with pytest.raises(cdb.CliError, match="kauket is not on PATH"):
+        cdb.ssh_key()

@@ -7,6 +7,10 @@ SSH (headscale at hs.gn.al) or SSM Session Manager - no open ports.
 
 Every run creates a throwaway venv (with boto3) under ./.clouddevbox in the
 current directory and removes it on exit, amun-style: nothing persists.
+
+The MasterSSH private key (VPS + devbox login) resolves per run:
+CLOUDDEVBOX_SSH_KEY -> ~/.ssh/gonzalo_main_private_key.pem -> kauket secret
+ssh.main_ssk_key into a throwaway tmp dir (see ssh_key()).
 """
 import argparse
 import datetime
@@ -19,15 +23,18 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
 VPS_USER = "gonzalo"
-SSH_KEY = str(Path.home() / ".ssh" / "gonzalo_main_private_key.pem")
+SSH_KEY_LOCAL = str(Path.home() / ".ssh" / "gonzalo_main_private_key.pem")
+KAUKET_SECRET = "ssh.main_ssk_key"
+KAUKET_CLIENT_HOME = str(Path.home() / ".config" / "kauket-operator-client")
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=15"]
 HS_CONTAINER = "cloudnet-headscale-1"
@@ -56,6 +63,8 @@ class CliError(Exception):
 # ---------------------------------------------------------------------------
 def _cleanup():
     shutil.rmtree(WORKDIR, ignore_errors=True)
+    if _SSH_KEY_TMPDIR:
+        shutil.rmtree(_SSH_KEY_TMPDIR, ignore_errors=True)
 
 
 def _bootstrap():
@@ -81,11 +90,74 @@ def _bootstrap():
 
 
 # ---------------------------------------------------------------------------
+# ssh key resolution: env override -> ~/.ssh -> kauket store (tmp, shredded)
+# ---------------------------------------------------------------------------
+_SSH_KEY_CACHE = None
+_SSH_KEY_TMPDIR = None
+
+
+def _kauket_get_key():
+    hint = (f"to fix, one of:\n"
+            f"  - enroll this machine in kauket for the ssh profile:\n"
+            f"      KAUKET_HOME={KAUKET_CLIENT_HOME} kauket enroll --request ssh\n"
+            f"    then `kauket approve` from the admin machine\n"
+            f"  - put the key at {SSH_KEY_LOCAL}\n"
+            f"  - point CLOUDDEVBOX_SSH_KEY at the key file")
+    kauket = shutil.which("kauket")
+    if not kauket:
+        raise CliError(f"ssh key not found at {SSH_KEY_LOCAL} and kauket is not on PATH; {hint}")
+    home = os.environ.get("KAUKET_HOME") or KAUKET_CLIENT_HOME
+    if not Path(home).is_dir():
+        raise CliError(f"ssh key not found at {SSH_KEY_LOCAL} and there is no kauket client "
+                       f"home at {home}; {hint}")
+    env = dict(os.environ, KAUKET_HOME=home)
+    last_err = ""
+    # --no-sync first: decrypts from the local store clone (fast, offline);
+    # the retry syncs to cover a bundle granted/updated since the last sync.
+    for extra in (["--no-sync"], []):
+        try:
+            p = subprocess.run([kauket, "get", KAUKET_SECRET, "--stdout", *extra],
+                               capture_output=True, timeout=120, env=env)
+        except subprocess.TimeoutExpired:
+            raise CliError(f"kauket get {KAUKET_SECRET} timed out")
+        if p.returncode == 0 and p.stdout:
+            return p.stdout
+        last_err = (p.stderr or p.stdout or b"").decode(errors="replace").strip()
+    raise CliError(f"kauket get {KAUKET_SECRET} failed: {last_err}\n{hint}")
+
+
+def ssh_key():
+    """Path to the private key for the VPS and devbox ssh, resolved once per
+    run: CLOUDDEVBOX_SSH_KEY -> ~/.ssh/gonzalo_main_private_key.pem -> kauket
+    secret ssh.main_ssk_key, fetched into a 0700 tmp dir removed on exit."""
+    global _SSH_KEY_CACHE, _SSH_KEY_TMPDIR
+    if _SSH_KEY_CACHE:
+        return _SSH_KEY_CACHE
+    override = os.environ.get("CLOUDDEVBOX_SSH_KEY")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_file():
+            raise CliError(f"CLOUDDEVBOX_SSH_KEY={override} is not a file")
+        _SSH_KEY_CACHE = str(path)
+    elif Path(SSH_KEY_LOCAL).is_file():
+        _SSH_KEY_CACHE = SSH_KEY_LOCAL
+    else:
+        print(f"fetching ssh key from kauket ({KAUKET_SECRET})...", file=sys.stderr)
+        content = _kauket_get_key()
+        _SSH_KEY_TMPDIR = tempfile.mkdtemp(prefix="clouddevbox-")
+        key = Path(_SSH_KEY_TMPDIR) / "ssh-key.pem"
+        key.touch(mode=0o600)
+        key.write_bytes(content)
+        _SSH_KEY_CACHE = str(key)
+    return _SSH_KEY_CACHE
+
+
+# ---------------------------------------------------------------------------
 # headscale over VPS ssh
 # ---------------------------------------------------------------------------
 def vps_run(cmd, timeout=90):
     try:
-        p = subprocess.run(["ssh", *SSH_OPTS, "-i", SSH_KEY, "-l", VPS_USER, VPS_HOST, cmd],
+        p = subprocess.run(["ssh", *SSH_OPTS, "-i", ssh_key(), "-l", VPS_USER, VPS_HOST, cmd],
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise CliError(f"ssh to {VPS_HOST} timed out running: {cmd}")
@@ -571,7 +643,7 @@ def cmd_ssh(args, session, account):
     base = ["ssh",
             "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
             "-o", "LogLevel=ERROR",
-            "-i", SSH_KEY, "-l", VPS_USER]
+            "-i", ssh_key(), "-l", VPS_USER]
     if _tcp_reachable(SOCKS_HOST, SOCKS_PORT, 1.5):
         cmd = [*base, "-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p",
                target, *args.command]
