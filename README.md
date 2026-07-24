@@ -19,19 +19,25 @@ creates a throwaway venv under `./.clouddevbox` in the current directory
 - `node` on PATH (asdf/brew) — only needed by `new` (runs `cdk deploy`).
 - `session-manager-plugin` on PATH for `ssm` — install via gear:
   `~/.gear/com/session-manager-plugin/setup-darwin` (or `setup-debian`).
-- The **MasterSSH private key**, resolved per run in this order (also needed
-  by `new`/`list`/`destroy`/`start`/`status`, which ssh to `hs.gn.al` for
-  headscale):
-  1. `CLOUDDEVBOX_SSH_KEY` env var, if set;
-  2. `~/.ssh/gonzalo_main_private_key.pem`, if present (the usual case);
-  3. the **kauket** secret `ssh.main_ssk_key` — fetched with
+- An **ssh key that authenticates as `gonzalo@hs.gn.al`** (also needed by
+  `new`/`list`/`destroy`/`start`/`status`, which ssh there for headscale).
+  No key path or filename is hardcoded — only the owner email. Per run,
+  the CLI uses the first key that actually authenticates to the VPS:
+  1. `CLOUDDEVBOX_SSH_KEY` env var, if set (trusted as-is);
+  2. every `~/.ssh` key **tagged `gonzaloab@gmail.com`** — in its `.pub`
+     comment, or its embedded comment when there is no `.pub` — probed
+     against the VPS in order;
+  3. every **kauket `ssh.*` secret** granted to this machine — fetched with
      `kauket get --stdout` (`--no-sync` fast path, sync retry) into a `0700`
-     tmp dir (`0600` file) that is deleted on exit; nothing is installed
-     into `~/.ssh`. Requires a kauket client home at
+     tmp dir (`0600` files) deleted on exit, probed the same way; nothing
+     is installed into `~/.ssh`. Requires a kauket client home at
      `~/.config/kauket-operator-client` (or `$KAUKET_HOME`) granted the
      `ssh` profile. One-time setup on a new laptop:
      `KAUKET_HOME=~/.config/kauket-operator-client kauket enroll --request ssh`,
      then `kauket approve` from the admin machine.
+
+  To make a local key discoverable, give it a `.pub` whose comment holds the
+  email: `echo "$(ssh-keygen -y -f <key>) gonzaloab@gmail.com" > <key>.pub`.
 - Tailnet SSH also needs a path to the tailnet: the cn-socksnode proxy on
   `127.0.0.1:1055` (`~/dev/cn-socksnode/run.sh` — the Mac's only tailnet
   doorway, at home or away), or a native tailnet route (e.g. running

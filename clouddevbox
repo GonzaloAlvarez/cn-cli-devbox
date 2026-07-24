@@ -8,9 +8,10 @@ SSH (headscale at hs.gn.al) or SSM Session Manager - no open ports.
 Every run creates a throwaway venv (with boto3) under ./.clouddevbox in the
 current directory and removes it on exit, amun-style: nothing persists.
 
-The MasterSSH private key (VPS + devbox login) resolves per run:
-CLOUDDEVBOX_SSH_KEY -> ~/.ssh/gonzalo_main_private_key.pem -> kauket secret
-ssh.main_ssk_key into a throwaway tmp dir (see ssh_key()).
+No key path or name is hardcoded, only the owner email: the ssh key (VPS +
+devbox login) resolves per run to the first key that authenticates to the
+VPS - CLOUDDEVBOX_SSH_KEY if set, else every ~/.ssh key whose comment holds
+EMAIL, else every kauket ssh.* secret into a throwaway tmp dir (ssh_key()).
 """
 import argparse
 import datetime
@@ -27,18 +28,18 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
 VPS_USER = "gonzalo"
-SSH_KEY_LOCAL = str(Path.home() / ".ssh" / "gonzalo_main_private_key.pem")
-KAUKET_SECRET = "ssh.main_ssk_key"
+EMAIL = "gonzaloab@gmail.com"
+SSH_DIR = str(Path.home() / ".ssh")
 KAUKET_CLIENT_HOME = str(Path.home() / ".config" / "kauket-operator-client")
+KAUKET_SSH_PREFIX = "ssh."
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=15"]
 HS_CONTAINER = "cloudnet-headscale-1"
-HS_ADMIN_EMAIL = "gonzaloab@gmail.com"
 HS_USER_ID_FALLBACK = "2"
 SOCKS_HOST, SOCKS_PORT = "127.0.0.1", 1055
 CDK_REPO_URL = "https://github.com/GonzaloAlvarez/cn-cdk-devbox"
@@ -90,47 +91,119 @@ def _bootstrap():
 
 
 # ---------------------------------------------------------------------------
-# ssh key resolution: env override -> ~/.ssh -> kauket store (tmp, shredded)
+# ssh key resolution: nothing about the key is hardcoded except EMAIL.
+# Candidates are ~/.ssh keys identified by EMAIL in the .pub (or embedded)
+# comment, probed against the VPS; if none authenticate, every granted
+# kauket ssh.* secret is fetched into a throwaway tmp dir and probed too.
 # ---------------------------------------------------------------------------
 _SSH_KEY_CACHE = None
 _SSH_KEY_TMPDIR = None
 
 
-def _kauket_get_key():
-    hint = (f"to fix, one of:\n"
-            f"  - enroll this machine in kauket for the ssh profile:\n"
-            f"      KAUKET_HOME={KAUKET_CLIENT_HOME} kauket enroll --request ssh\n"
-            f"    then `kauket approve` from the admin machine\n"
-            f"  - put the key at {SSH_KEY_LOCAL}\n"
-            f"  - point CLOUDDEVBOX_SSH_KEY at the key file")
+def _candidate_keys():
+    """Private keys under ~/.ssh associated with EMAIL: a companion .pub
+    mentioning it, or (when there is no .pub) an embedded comment that
+    ssh-keygen -l can surface."""
+    found = []
+    ssh_dir = Path(SSH_DIR)
+    if not ssh_dir.is_dir():
+        return found
+    for priv in sorted(ssh_dir.iterdir()):
+        if priv.suffix == ".pub" or not priv.is_file():
+            continue
+        try:
+            with open(priv, "rb") as f:
+                if b"PRIVATE KEY" not in f.read(80):
+                    continue
+        except OSError:
+            continue
+        pub = priv.with_name(priv.name + ".pub")
+        if pub.is_file():
+            try:
+                if EMAIL in pub.read_text():
+                    found.append(str(priv))
+            except OSError:
+                pass
+        else:
+            try:
+                p = subprocess.run(["ssh-keygen", "-l", "-f", str(priv)],
+                                   capture_output=True, text=True, timeout=10,
+                                   stdin=subprocess.DEVNULL)
+                if p.returncode == 0 and EMAIL in p.stdout:
+                    found.append(str(priv))
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+    return found
+
+
+def _key_works(path):
+    """True when the key authenticates to the VPS - the same identity the
+    devboxes trust (their authorized_keys holds the master public key)."""
+    try:
+        p = subprocess.run(["ssh", *SSH_OPTS, "-o", "IdentitiesOnly=yes",
+                            "-i", path, "-l", VPS_USER, VPS_HOST, "true"],
+                           capture_output=True, timeout=45)
+        return p.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _kauket_client():
+    """(kauket_binary, env-with-KAUKET_HOME), or (None, why-not)."""
     kauket = shutil.which("kauket")
     if not kauket:
-        raise CliError(f"ssh key not found at {SSH_KEY_LOCAL} and kauket is not on PATH; {hint}")
+        return None, "kauket is not on PATH"
     home = os.environ.get("KAUKET_HOME") or KAUKET_CLIENT_HOME
     if not Path(home).is_dir():
-        raise CliError(f"ssh key not found at {SSH_KEY_LOCAL} and there is no kauket client "
-                       f"home at {home}; {hint}")
-    env = dict(os.environ, KAUKET_HOME=home)
-    last_err = ""
-    # --no-sync first: decrypts from the local store clone (fast, offline);
-    # the retry syncs to cover a bundle granted/updated since the last sync.
-    for extra in (["--no-sync"], []):
-        try:
-            p = subprocess.run([kauket, "get", KAUKET_SECRET, "--stdout", *extra],
-                               capture_output=True, timeout=120, env=env)
-        except subprocess.TimeoutExpired:
-            raise CliError(f"kauket get {KAUKET_SECRET} timed out")
-        if p.returncode == 0 and p.stdout:
-            return p.stdout
-        last_err = (p.stderr or p.stdout or b"").decode(errors="replace").strip()
-    raise CliError(f"kauket get {KAUKET_SECRET} failed: {last_err}\n{hint}")
+        return None, f"no kauket client home at {home}"
+    return kauket, dict(os.environ, KAUKET_HOME=home)
+
+
+def _kauket_fetch_ssh_keys(kauket, env):
+    """Fetch every granted ssh.* secret into the run's tmp dir (0600 files
+    in a 0700 dir removed on exit); returns the written paths."""
+    global _SSH_KEY_TMPDIR
+    try:
+        p = subprocess.run([kauket, "list"], capture_output=True, text=True,
+                           timeout=120, env=env)
+    except subprocess.TimeoutExpired:
+        raise CliError("kauket list timed out")
+    if p.returncode != 0:
+        raise CliError(f"kauket list failed: {(p.stderr or p.stdout).strip()}")
+    ids = [line.split()[0] for line in p.stdout.splitlines()
+           if line.strip() and line.split()[0].startswith(KAUKET_SSH_PREFIX)]
+    paths = []
+    for sid in ids:
+        content = None
+        # --no-sync first: decrypts from the local store clone (fast,
+        # offline); the retry syncs for a bundle updated since.
+        for extra in (["--no-sync"], []):
+            try:
+                g = subprocess.run([kauket, "get", sid, "--stdout", *extra],
+                                   capture_output=True, timeout=120, env=env)
+            except subprocess.TimeoutExpired:
+                continue
+            if g.returncode == 0 and g.stdout:
+                content = g.stdout
+                break
+        if content is None:
+            print(f"warning: kauket get {sid} failed, skipping", file=sys.stderr)
+            continue
+        if _SSH_KEY_TMPDIR is None:
+            _SSH_KEY_TMPDIR = tempfile.mkdtemp(prefix="clouddevbox-")
+        key = Path(_SSH_KEY_TMPDIR) / sid
+        key.touch(mode=0o600)
+        key.write_bytes(content)
+        paths.append(str(key))
+    return paths
 
 
 def ssh_key():
-    """Path to the private key for the VPS and devbox ssh, resolved once per
-    run: CLOUDDEVBOX_SSH_KEY -> ~/.ssh/gonzalo_main_private_key.pem -> kauket
-    secret ssh.main_ssk_key, fetched into a 0700 tmp dir removed on exit."""
-    global _SSH_KEY_CACHE, _SSH_KEY_TMPDIR
+    """Path to a working private key for the VPS and devbox ssh, resolved
+    once per run: CLOUDDEVBOX_SSH_KEY wins if set; otherwise the first
+    EMAIL-tagged ~/.ssh key that authenticates to the VPS, then the first
+    working kauket ssh.* secret."""
+    global _SSH_KEY_CACHE
     if _SSH_KEY_CACHE:
         return _SSH_KEY_CACHE
     override = os.environ.get("CLOUDDEVBOX_SSH_KEY")
@@ -139,17 +212,33 @@ def ssh_key():
         if not path.is_file():
             raise CliError(f"CLOUDDEVBOX_SSH_KEY={override} is not a file")
         _SSH_KEY_CACHE = str(path)
-    elif Path(SSH_KEY_LOCAL).is_file():
-        _SSH_KEY_CACHE = SSH_KEY_LOCAL
-    else:
-        print(f"fetching ssh key from kauket ({KAUKET_SECRET})...", file=sys.stderr)
-        content = _kauket_get_key()
-        _SSH_KEY_TMPDIR = tempfile.mkdtemp(prefix="clouddevbox-")
-        key = Path(_SSH_KEY_TMPDIR) / "ssh-key.pem"
-        key.touch(mode=0o600)
-        key.write_bytes(content)
-        _SSH_KEY_CACHE = str(key)
-    return _SSH_KEY_CACHE
+        return _SSH_KEY_CACHE
+    local = _candidate_keys()
+    for cand in local:
+        if _key_works(cand):
+            _SSH_KEY_CACHE = cand
+            return cand
+    print((f"none of {len(local)} ~/.ssh key(s) tagged {EMAIL} authenticate to "
+           f"{VPS_HOST}" if local else f"no ~/.ssh key tagged {EMAIL}")
+          + "; trying kauket...", file=sys.stderr)
+    hint = (f"fix one of:\n"
+            f"  - hold a working key in {SSH_DIR} whose .pub comment contains {EMAIL}\n"
+            f"  - enroll this machine in kauket for the ssh profile:\n"
+            f"      KAUKET_HOME={KAUKET_CLIENT_HOME} kauket enroll --request ssh\n"
+            f"    then `kauket approve` from the admin machine\n"
+            f"  - point CLOUDDEVBOX_SSH_KEY at a working key file")
+    kauket, env = _kauket_client()
+    if kauket is None:
+        raise CliError(f"no working ssh key for {VPS_USER}@{VPS_HOST} ({env}); {hint}")
+    fetched = _kauket_fetch_ssh_keys(kauket, env)
+    for cand in fetched:
+        if _key_works(cand):
+            _SSH_KEY_CACHE = cand
+            return cand
+    raise CliError(
+        f"no working ssh key for {VPS_USER}@{VPS_HOST}: {len(local)} local candidate(s)"
+        f" and {len(fetched)} kauket ssh.* secret(s) all failed to authenticate"
+        f" (is {VPS_HOST} reachable?); {hint}")
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +309,7 @@ def hs_user_id():
     try:
         users = json.loads(headscale("users list -o json"))
         for u in users or []:
-            if _field(u, "email", default="") == HS_ADMIN_EMAIL:
+            if _field(u, "email", default="") == EMAIL:
                 return str(_field(u, "id"))
     except (CliError, json.JSONDecodeError):
         pass
