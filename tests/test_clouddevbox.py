@@ -134,6 +134,36 @@ def test_ssh_falls_back_to_direct_route():
     assert cmd[-1] == "100.64.0.99"
 
 
+def test_new_stale_node_suggests_destroy(monkeypatch):
+    """The stale-node hint must go through `clouddevbox destroy` (the CLI's
+    authenticated ssh path), never a raw `ssh hs.gn.al` one-liner - that
+    fails silently on machines whose local username differs from VPS_USER."""
+    import pytest
+
+    class Args:
+        name = "dev1"
+        profile = "p"
+        type = "m7g.large"
+        disk = 50
+        autostop = "6h"
+        plugins = "kauket"
+
+    class Session:
+        def client(self, name):
+            return None
+
+    monkeypatch.setattr(cdb, "find_instance", lambda ec2, name, states=None: None)
+    monkeypatch.setattr(cdb, "stack_status", lambda cfn, name: (None, None, None))
+    monkeypatch.setattr(cdb, "hs_nodes", lambda: {
+        "devbox-dev1": {"id": "37", "online": False, "ip": None, "last_seen": None}})
+    with pytest.raises(cdb.CliError) as e:
+        cdb.cmd_new(Args(), Session(), "123456789012")
+    msg = str(e.value)
+    assert "clouddevbox destroy dev1 --profile p" in msg
+    assert "id 37" in msg
+    assert "ssh " not in msg
+
+
 def test_ssh_errors_when_no_path():
     import pytest
     saved = (cdb.hs_nodes, cdb._tcp_reachable)

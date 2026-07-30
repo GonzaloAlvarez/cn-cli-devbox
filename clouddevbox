@@ -28,7 +28,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -549,9 +549,13 @@ def cmd_new(args, session, account):
     if nodes is None:
         raise CliError(f"cannot reach headscale via {VPS_HOST} - needed to mint the tailnet key")
     if f"devbox-{name}" in nodes:
-        raise CliError(f"stale headscale node 'devbox-{name}' exists; remove it first: "
-                       f"ssh {VPS_HOST} 'docker exec {HS_CONTAINER} headscale nodes delete "
-                       f"--identifier {nodes[f'devbox-{name}']['id']} --force'")
+        # don't suggest a raw `ssh hs.gn.al` one-liner: it silently fails on
+        # machines whose local username differs from the VPS user (no -l, no
+        # key); destroy reuses this run's authenticated ssh path and also
+        # sweeps leftover /devbox/<name>/* parameters.
+        raise CliError(f"stale headscale node 'devbox-{name}' exists "
+                       f"(id {nodes[f'devbox-{name}']['id']}); remove it first: "
+                       f"clouddevbox destroy {name} --profile {args.profile}")
 
     repo = resolve_cdk_repo()
 
