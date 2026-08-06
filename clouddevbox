@@ -5,8 +5,9 @@ Boxes are identified by EC2 instance tags (devbox:name / devbox:managed-by);
 CloudFormation stacks Devbox-<name> own their lifecycle. Access is tailnet
 SSH (headscale at hs.gn.al) or SSM Session Manager - no open ports.
 
-Every run creates a throwaway venv (with boto3) under ./.clouddevbox in the
-current directory and removes it on exit, amun-style: nothing persists.
+Every run creates a throwaway venv (boto3 + bullet, its pip upgraded) under
+./.clouddevbox in the current directory and removes it on exit, amun-style:
+nothing persists.
 
 No key path or name is hardcoded, only the owner email: the ssh key (VPS +
 devbox login) resolves per run to the first key that authenticates to the
@@ -28,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -71,17 +72,23 @@ def _cleanup():
 def _bootstrap():
     try:
         import boto3  # noqa: F401
+        import bullet  # noqa: F401
         return
     except ImportError:
         pass
     if os.environ.get("CLOUDDEVBOX_REEXEC"):
-        sys.exit("clouddevbox: boto3 still missing after venv bootstrap")
+        sys.exit("clouddevbox: deps still missing after venv bootstrap")
     _cleanup()
     venv = WORKDIR / "venv"
-    print("bootstrapping throwaway venv (boto3)...", file=sys.stderr)
+    print("bootstrapping throwaway venv (boto3 + bullet)...", file=sys.stderr)
     try:
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
-        subprocess.run([str(venv / "bin" / "pip"), "install", "--quiet", "boto3"], check=True)
+        # venv's bundled pip lags PyPI and nags on every run; upgrade it
+        # in-venv only (never the interpreter's global pip)
+        subprocess.run([str(venv / "bin" / "python"), "-m", "pip", "install",
+                        "--quiet", "--upgrade", "pip"], check=True)
+        subprocess.run([str(venv / "bin" / "pip"), "install", "--quiet",
+                        "boto3", "bullet"], check=True)
     except BaseException:
         _cleanup()
         raise
@@ -332,6 +339,32 @@ def hs_delete_node(node_id):
 # ---------------------------------------------------------------------------
 # AWS session / EC2 helpers
 # ---------------------------------------------------------------------------
+def _available_profiles():
+    import boto3
+    return list(boto3.session.Session().available_profiles)
+
+
+def select_profile():
+    """Interactive AWS profile picker (bullet menu) for runs that omit
+    --profile; needs a tty, so scripts keep passing --profile explicitly."""
+    if not sys.stdin.isatty():
+        raise CliError("--profile is required when stdin is not a tty")
+    profiles = _available_profiles()
+    if not profiles:
+        raise CliError("no AWS profiles found in ~/.aws/config or ~/.aws/credentials")
+    from bullet import Bullet
+    return Bullet(
+        prompt="Select AWS Profile:",
+        choices=profiles,
+        indent=0,
+        align=5,
+        margin=1,
+        shift=0,
+        bullet="→",
+        pad_right=5,
+    ).launch()
+
+
 def make_session(profile):
     import boto3
     import botocore.exceptions as bex
@@ -438,6 +471,8 @@ def cdk_deploy(repo, profile, account, stacks, context):
     try:
         print("preparing cdk toolchain (throwaway .venv/.npm in the checkout)...")
         subprocess.run([base_python, "-m", "venv", str(venv)], check=True)
+        subprocess.run([str(venv / "bin" / "python"), "-m", "pip", "install",
+                        "--quiet", "--upgrade", "pip"], check=True)
         subprocess.run([str(venv / "bin" / "pip"), "install", "--quiet", "-r",
                         str(repo / "requirements.txt")], check=True)
         subprocess.run(["npm", "install", "--prefix", str(npm), "--silent", "aws-cdk"],
@@ -818,8 +853,9 @@ def build_parser():
                     f"region {REGION}).")
     parser.add_argument("--version", action="version", version=f"clouddevbox {VERSION}")
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--profile", required=True,
-                        help="AWS profile (mandatory; account is derived via STS)")
+    common.add_argument("--profile",
+                        help="AWS profile (interactive picker when omitted; "
+                             "account is derived via STS)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("new", parents=[common], help="create a devbox")
@@ -876,6 +912,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if not args.profile:
+        # subcommand hints interpolate args.profile, so fill in the selection
+        args.profile = select_profile()
     session, account = make_session(args.profile)
     args.fn(args, session, account)
     return 0

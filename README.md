@@ -8,14 +8,17 @@ SSH **over the headscale tailnet** or **SSM Session Manager**, nothing else.
 Installed via [gear](https://github.com/GonzaloAlvarez/gear)
 (`com/clouddevbox`) to `~/bin/clouddevbox`. Single-file Python; every run
 creates a throwaway venv under `./.clouddevbox` in the current directory
-(boto3) and deletes it on exit — amun-style, nothing persists between runs
+(boto3 + bullet; the venv's own pip is upgraded so it never nags) and
+deletes it on exit — amun-style, nothing persists between runs
 (costs ~10-20 s per invocation).
 
 ## Prerequisites
 
-- An AWS profile in `~/.aws/config` / `~/.aws/credentials`. **`--profile` is
-  mandatory on every command** — there is no default and no env fallback.
-  SSO profiles work; on expiry the CLI tells you to `aws sso login`.
+- An AWS profile in `~/.aws/config` / `~/.aws/credentials`. Every command
+  takes `--profile`; **when omitted on a tty, an interactive menu (bullet)
+  lists the available profiles** — there is still no default and no env
+  fallback, so scripts/non-tty runs must pass it. SSO profiles work; on
+  expiry the CLI tells you to `aws sso login`.
 - `node` on PATH (asdf/brew) — only needed by `new` (runs `cdk deploy`).
 - `session-manager-plugin` on PATH for `ssm` — install via gear:
   `~/.gear/com/session-manager-plugin/setup-darwin` (or `setup-debian`).
@@ -55,6 +58,7 @@ clouddevbox new alpha --profile personal              # m7g.large, 50 GB, 6h aut
 clouddevbox new beta  --profile personal --type m7g.xlarge --disk 100 \
                       --plugins kauket,docker --autostop 10h
 clouddevbox list --profile personal
+clouddevbox list                                      # no --profile: interactive picker
 clouddevbox ssh alpha --profile personal              # tailnet, via socks proxy
 clouddevbox ssh alpha --profile personal --show       # also print the raw ssh command
 clouddevbox ssh alpha --profile personal -- uname -a

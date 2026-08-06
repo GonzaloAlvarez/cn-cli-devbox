@@ -293,3 +293,56 @@ def test_ssh_key_no_kauket_on_path(tmp_path, monkeypatch):
     monkeypatch.setattr(cdb.shutil, "which", lambda n: None)
     with pytest.raises(cdb.CliError, match="kauket is not on PATH"):
         cdb.ssh_key()
+
+
+# ---------------------------------------------------------------------------
+# --profile: optional everywhere; interactive bullet picker when omitted
+# ---------------------------------------------------------------------------
+import io
+import sys as _sys
+import types
+
+
+class _Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_profile_optional_in_parser():
+    args = cdb.build_parser().parse_args(["list"])
+    assert args.profile is None
+    args = cdb.build_parser().parse_args(["list", "--profile", "p"])
+    assert args.profile == "p"
+
+
+def test_select_profile_requires_tty(monkeypatch):
+    import pytest
+    monkeypatch.setattr(cdb.sys, "stdin", io.StringIO())  # isatty() -> False
+    with pytest.raises(cdb.CliError, match="--profile is required"):
+        cdb.select_profile()
+
+
+def test_select_profile_no_profiles(monkeypatch):
+    import pytest
+    monkeypatch.setattr(cdb.sys, "stdin", _Tty())
+    monkeypatch.setattr(cdb, "_available_profiles", lambda: [])
+    with pytest.raises(cdb.CliError, match="no AWS profiles"):
+        cdb.select_profile()
+
+
+def test_select_profile_launches_bullet(monkeypatch):
+    monkeypatch.setattr(cdb.sys, "stdin", _Tty())
+    monkeypatch.setattr(cdb, "_available_profiles", lambda: ["personal", "work"])
+    captured = {}
+
+    class FakeBullet:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def launch(self):
+            return "work"
+
+    monkeypatch.setitem(_sys.modules, "bullet",
+                        types.SimpleNamespace(Bullet=FakeBullet))
+    assert cdb.select_profile() == "work"
+    assert captured["choices"] == ["personal", "work"]
