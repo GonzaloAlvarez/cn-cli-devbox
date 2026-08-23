@@ -154,3 +154,21 @@ it persists across stop/start.
 - SSM sessions land as `ssm-user`; use `sudo su - gonzalo`.
 - Never `cdk deploy` an existing box from a fresh checkout — see the
   AMI-drift warning in the cn-cdk-devbox README (instance replacement).
+
+## Termux (Android)
+
+Works on Termux — gear installs it via `~/.gear/run clouddevbox` (which
+dispatches `com/clouddevbox/setup-termux`), and the self-venv bootstrap runs
+on the Termux python (amun installs `python-ensurepip-wheels`, so
+`python -m venv` seeds pip; boto3/bullet are pure-python).
+
+- **Supported**: everything except `ssm` — there are no aws CLI v2 /
+  session-manager-plugin builds for bionic. Use `clouddevbox ssh`.
+- **Tailnet path**: install the Tailscale Android app and log into headscale;
+  its kernel VPN covers Termux sockets, so the direct-to-tailnet-IP branch of
+  `ssh` works — no `nc`/SOCKS proxy needed on the phone.
+- **SSH key**: set `CLOUDDEVBOX_SSH_KEY=~/.ssh/<key>` to bypass kauket key
+  discovery (kauket runs on Termux, but pure-Go DNS resolution can fail on a
+  real device — no `/etc/resolv.conf` outside containers).
+- Run from a writable CWD (e.g. `$HOME`) — the throwaway `.clouddevbox` venv
+  is created in the current directory and `/sdcard` is noexec.
