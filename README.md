@@ -24,23 +24,28 @@ deletes it on exit — amun-style, nothing persists between runs
   `~/.gear/com/session-manager-plugin/setup-darwin` (or `setup-debian`).
 - An **ssh key that authenticates as `gonzalo@hs.gn.al`** (also needed by
   `new`/`list`/`destroy`/`start`/`status`, which ssh there for headscale).
-  No key path or filename is hardcoded — only the owner email. Per run,
-  the CLI uses the first key that actually authenticates to the VPS:
+  **New-machine setup is two commands**: `kauket request
+  ssh.gonzalo_main_private_key` (enrolls this machine; approve from the
+  admin machine), then `kauket get ssh.gonzalo_main_private_key` — it
+  installs the master key at the canonical path the CLI checks first.
+  Per run, the CLI uses the first key that actually authenticates to the
+  VPS:
   1. `CLOUDDEVBOX_SSH_KEY` env var, if set (trusted as-is);
-  2. every `~/.ssh` key **tagged `gonzaloab@gmail.com`** — in its `.pub`
-     comment, or its embedded comment when there is no `.pub` — probed
-     against the VPS in order;
-  3. every **kauket `ssh.*` secret** granted to this machine — fetched with
+  2. the **kauket-canonical paths** `~/.ssh/gonzalo_main_private_key` and
+     `~/.ssh/gonzalo_main_private_key.pem` — no `.pub` or comment needed;
+  3. every other `~/.ssh` key **tagged `gonzaloab@gmail.com`** — in its
+     `.pub` comment, or its embedded comment when there is no `.pub`;
+  4. every **kauket `ssh.*` secret** granted to this machine — fetched with
      `kauket get --stdout` (`--no-sync` fast path, sync retry) into a `0700`
      tmp dir (`0600` files) deleted on exit, probed the same way; nothing
-     is installed into `~/.ssh`. Requires a kauket client home at
-     `~/.config/kauket-operator-client` (or `$KAUKET_HOME`) granted the
-     `ssh` profile. One-time setup on a new laptop:
-     `KAUKET_HOME=~/.config/kauket-operator-client kauket enroll --request ssh`,
-     then `kauket approve` from the admin machine.
+     is installed into `~/.ssh`. Uses `$KAUKET_HOME` if set, else the
+     default kauket client home (`~/Library/Application Support/kauket` on
+     macOS, `~/.config/kauket` elsewhere), else the legacy
+     `~/.config/kauket-operator-client`.
 
-  To make a local key discoverable, give it a `.pub` whose comment holds the
-  email: `echo "$(ssh-keygen -y -f <key>) gonzaloab@gmail.com" > <key>.pub`.
+  To make some other local key discoverable, give it a `.pub` whose comment
+  holds the email:
+  `echo "$(ssh-keygen -y -f <key>) gonzaloab@gmail.com" > <key>.pub`.
 - Tailnet SSH also needs a path to the tailnet: the cn-socksnode proxy on
   `127.0.0.1:1055` (`~/dev/cn-socksnode/run.sh` — the Mac's only tailnet
   doorway, at home or away), or a native tailnet route (e.g. running

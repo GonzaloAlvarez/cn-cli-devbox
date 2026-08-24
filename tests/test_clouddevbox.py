@@ -209,6 +209,55 @@ def test_candidate_keys_discovery(tmp_path, monkeypatch):
     assert cdb._candidate_keys() == [str(tmp_path / "embedded"), str(tmp_path / "mine")]
 
 
+def test_candidate_keys_canonical_first(tmp_path, monkeypatch):
+    _reset_key_state(monkeypatch)
+    monkeypatch.setattr(cdb, "SSH_DIR", str(tmp_path))
+    _gen_key(tmp_path, "mine", cdb.EMAIL)
+    _gen_key(tmp_path, "tmpname", "whatever-comment")     # kauket-style: no .pub, no email
+    (tmp_path / "tmpname.pub").unlink()
+    (tmp_path / "tmpname").rename(tmp_path / "gonzalo_main_private_key")
+    assert cdb._candidate_keys() == [str(tmp_path / "gonzalo_main_private_key"),
+                                     str(tmp_path / "mine")]
+
+
+def test_candidate_keys_canonical_pem_and_dedupe(tmp_path, monkeypatch):
+    _reset_key_state(monkeypatch)
+    monkeypatch.setattr(cdb, "SSH_DIR", str(tmp_path))
+    _gen_key(tmp_path, "k1", "no-pub-no-comment-match")
+    (tmp_path / "k1.pub").unlink()
+    (tmp_path / "k1").rename(tmp_path / "gonzalo_main_private_key")
+    _gen_key(tmp_path, "k2", cdb.EMAIL)                   # .pem variant WITH email .pub
+    (tmp_path / "k2").rename(tmp_path / "gonzalo_main_private_key.pem")
+    (tmp_path / "k2.pub").rename(tmp_path / "gonzalo_main_private_key.pem.pub")
+    got = cdb._candidate_keys()
+    assert got == [str(tmp_path / "gonzalo_main_private_key"),
+                   str(tmp_path / "gonzalo_main_private_key.pem")]
+
+
+def test_kauket_client_home_order(tmp_path, monkeypatch):
+    _reset_key_state(monkeypatch)
+    exe = tmp_path / "kauket"
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(cdb.shutil, "which",
+                        lambda n: str(exe) if n == "kauket" else None)
+    default = tmp_path / "default-home"
+    legacy = tmp_path / "legacy-home"
+    monkeypatch.setattr(cdb, "_default_kauket_homes",
+                        lambda: [str(default), str(legacy)])
+    envhome = tmp_path / "env-home"
+    envhome.mkdir()
+    monkeypatch.setenv("KAUKET_HOME", str(envhome))
+    assert cdb._kauket_client()[1]["KAUKET_HOME"] == str(envhome)
+    monkeypatch.delenv("KAUKET_HOME")
+    kauket, why = cdb._kauket_client()
+    assert kauket is None and "no kauket client home" in why
+    legacy.mkdir()
+    assert cdb._kauket_client()[1]["KAUKET_HOME"] == str(legacy)
+    default.mkdir()
+    assert cdb._kauket_client()[1]["KAUKET_HOME"] == str(default)
+
+
 def test_ssh_key_env_override(tmp_path, monkeypatch):
     _reset_key_state(monkeypatch)
     key = tmp_path / "mykey.pem"

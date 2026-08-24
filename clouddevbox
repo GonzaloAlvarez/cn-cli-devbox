@@ -29,13 +29,16 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
 VPS_USER = "gonzalo"
 EMAIL = "gonzaloab@gmail.com"
 SSH_DIR = str(Path.home() / ".ssh")
+# The kauket-canonical master-key install paths (kauket get
+# ssh.gonzalo_main_private_key); tried first, no .pub or comment needed.
+CANONICAL_KEYS = ("gonzalo_main_private_key", "gonzalo_main_private_key.pem")
 KAUKET_CLIENT_HOME = str(Path.home() / ".config" / "kauket-operator-client")
 KAUKET_SSH_PREFIX = "ssh."
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -98,25 +101,38 @@ def _bootstrap():
 
 
 # ---------------------------------------------------------------------------
-# ssh key resolution: nothing about the key is hardcoded except EMAIL.
-# Candidates are ~/.ssh keys identified by EMAIL in the .pub (or embedded)
-# comment, probed against the VPS; if none authenticate, every granted
-# kauket ssh.* secret is fetched into a throwaway tmp dir and probed too.
+# ssh key resolution. Candidates, in order: the kauket-canonical master-key
+# paths (CANONICAL_KEYS — what `kauket get ssh.gonzalo_main_private_key`
+# installs, so a freshly enrolled machine needs no .pub/comment fiddling),
+# then ~/.ssh keys identified by EMAIL in the .pub (or embedded) comment.
+# Every candidate is probed against the VPS; if none authenticate, every
+# granted kauket ssh.* secret is fetched into a throwaway tmp dir and
+# probed too.
 # ---------------------------------------------------------------------------
 _SSH_KEY_CACHE = None
 _SSH_KEY_TMPDIR = None
 
 
 def _candidate_keys():
-    """Private keys under ~/.ssh associated with EMAIL: a companion .pub
-    mentioning it, or (when there is no .pub) an embedded comment that
-    ssh-keygen -l can surface."""
+    """Private keys under ~/.ssh: the kauket-canonical master-key paths
+    first (no .pub or comment needed), then keys associated with EMAIL via
+    a companion .pub or an embedded comment ssh-keygen -l can surface."""
     found = []
     ssh_dir = Path(SSH_DIR)
     if not ssh_dir.is_dir():
         return found
+    for name in CANONICAL_KEYS:
+        priv = ssh_dir / name
+        try:
+            with open(priv, "rb") as f:
+                if b"PRIVATE KEY" in f.read(80):
+                    found.append(str(priv))
+        except OSError:
+            pass
     for priv in sorted(ssh_dir.iterdir()):
         if priv.suffix == ".pub" or not priv.is_file():
+            continue
+        if str(priv) in found:
             continue
         try:
             with open(priv, "rb") as f:
@@ -155,15 +171,28 @@ def _key_works(path):
         return False
 
 
+def _default_kauket_homes():
+    """Kauket base homes to try, mirroring kauket's own default
+    (os.UserConfigDir()/kauket) plus the legacy operator-client home."""
+    if sys.platform == "darwin":
+        default = Path.home() / "Library" / "Application Support" / "kauket"
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        default = Path(base) / "kauket"
+    return [str(default), KAUKET_CLIENT_HOME]
+
+
 def _kauket_client():
     """(kauket_binary, env-with-KAUKET_HOME), or (None, why-not)."""
     kauket = shutil.which("kauket")
     if not kauket:
         return None, "kauket is not on PATH"
-    home = os.environ.get("KAUKET_HOME") or KAUKET_CLIENT_HOME
-    if not Path(home).is_dir():
-        return None, f"no kauket client home at {home}"
-    return kauket, dict(os.environ, KAUKET_HOME=home)
+    env_home = os.environ.get("KAUKET_HOME")
+    homes = [env_home] if env_home else _default_kauket_homes()
+    for home in homes:
+        if Path(home).is_dir():
+            return kauket, dict(os.environ, KAUKET_HOME=home)
+    return None, f"no kauket client home at {' or '.join(homes)}"
 
 
 def _kauket_fetch_ssh_keys(kauket, env):
@@ -208,8 +237,8 @@ def _kauket_fetch_ssh_keys(kauket, env):
 def ssh_key():
     """Path to a working private key for the VPS and devbox ssh, resolved
     once per run: CLOUDDEVBOX_SSH_KEY wins if set; otherwise the first
-    EMAIL-tagged ~/.ssh key that authenticates to the VPS, then the first
-    working kauket ssh.* secret."""
+    candidate (kauket-canonical paths, then EMAIL-tagged ~/.ssh keys) that
+    authenticates to the VPS, then the first working kauket ssh.* secret."""
     global _SSH_KEY_CACHE
     if _SSH_KEY_CACHE:
         return _SSH_KEY_CACHE
@@ -229,10 +258,11 @@ def ssh_key():
            f"{VPS_HOST}" if local else f"no ~/.ssh key tagged {EMAIL}")
           + "; trying kauket...", file=sys.stderr)
     hint = (f"fix one of:\n"
+            f"  - install the master key at its canonical path:\n"
+            f"      kauket get ssh.gonzalo_main_private_key\n"
+            f"    (first time: kauket request ssh.gonzalo_main_private_key enrolls this\n"
+            f"     machine, then `kauket approve` from the admin machine)\n"
             f"  - hold a working key in {SSH_DIR} whose .pub comment contains {EMAIL}\n"
-            f"  - enroll this machine in kauket for the ssh profile:\n"
-            f"      KAUKET_HOME={KAUKET_CLIENT_HOME} kauket enroll --request ssh\n"
-            f"    then `kauket approve` from the admin machine\n"
             f"  - point CLOUDDEVBOX_SSH_KEY at a working key file")
     kauket, env = _kauket_client()
     if kauket is None:
