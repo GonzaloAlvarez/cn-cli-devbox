@@ -15,9 +15,11 @@ deletes it on exit — amun-style, nothing persists between runs
 ## Prerequisites
 
 - An AWS profile in `~/.aws/config` / `~/.aws/credentials`. Every command
-  takes `--profile`; **when omitted on a tty, an interactive menu (bullet)
-  lists the available profiles** — there is still no default and no env
-  fallback, so scripts/non-tty runs must pass it. SSO profiles work; on
+  takes `--profile`; **when omitted, a sole configured profile is used
+  automatically (tty or not), and with more than one an interactive menu
+  (bullet) lists them on a tty** — there is still no default and no env
+  fallback beyond that, so scripts on multi-profile machines must pass it.
+  SSO profiles work; on
   expiry the CLI tells you to `aws sso login`.
 - `node` on PATH (asdf/brew) — only needed by `new` (runs `cdk deploy`).
 - `session-manager-plugin` on PATH for `ssm` — install via gear:

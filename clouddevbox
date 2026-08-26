@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -375,13 +375,18 @@ def _available_profiles():
 
 
 def select_profile():
-    """Interactive AWS profile picker (bullet menu) for runs that omit
-    --profile; needs a tty, so scripts keep passing --profile explicitly."""
-    if not sys.stdin.isatty():
-        raise CliError("--profile is required when stdin is not a tty")
+    """Resolve the AWS profile for runs that omit --profile: a single
+    configured profile is used as-is (tty or not); more than one opens an
+    interactive bullet picker, which needs a tty, so scripts on multi-profile
+    machines keep passing --profile explicitly."""
     profiles = _available_profiles()
     if not profiles:
         raise CliError("no AWS profiles found in ~/.aws/config or ~/.aws/credentials")
+    if len(profiles) == 1:
+        print(f"using the only configured AWS profile: {profiles[0]}")
+        return profiles[0]
+    if not sys.stdin.isatty():
+        raise CliError("--profile is required when stdin is not a tty")
     from bullet import Bullet
     return Bullet(
         prompt="Select AWS Profile:",

@@ -367,8 +367,16 @@ def test_profile_optional_in_parser():
 def test_select_profile_requires_tty(monkeypatch):
     import pytest
     monkeypatch.setattr(cdb.sys, "stdin", io.StringIO())  # isatty() -> False
+    monkeypatch.setattr(cdb, "_available_profiles", lambda: ["personal", "work"])
     with pytest.raises(cdb.CliError, match="--profile is required"):
         cdb.select_profile()
+
+
+def test_select_profile_single_auto_selects(monkeypatch):
+    # a sole configured profile is used without a picker, even without a tty
+    monkeypatch.setattr(cdb.sys, "stdin", io.StringIO())  # isatty() -> False
+    monkeypatch.setattr(cdb, "_available_profiles", lambda: ["personal"])
+    assert cdb.select_profile() == "personal"
 
 
 def test_select_profile_no_profiles(monkeypatch):
