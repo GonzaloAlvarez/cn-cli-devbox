@@ -70,6 +70,9 @@ clouddevbox ssh alpha --profile personal              # tailnet, via socks proxy
 clouddevbox ssh alpha --profile personal --show       # also print the raw ssh command
 clouddevbox ssh alpha --profile personal -- uname -a
 clouddevbox ssm alpha --profile personal              # Session Manager (break-glass)
+clouddevbox copy report.txt alpha:/tmp/ --profile personal   # scp, local -> box
+clouddevbox copy alpha:/var/log/syslog . --profile personal  # scp, box -> local
+clouddevbox tun alpha 8080 8000 --profile personal    # localhost:8080 -> box's 127.0.0.1:8000
 clouddevbox status alpha --profile personal           # provisioning/autostop/tailnet state
 clouddevbox stop alpha --profile personal             # EBS-only cost while stopped
 clouddevbox start alpha --profile personal
@@ -81,6 +84,24 @@ clouddevbox destroy alpha --profile personal          # stack + node + params, c
 (`devbox:name`, `devbox:managed-by=clouddevbox`); `new` and `destroy` operate
 on the CloudFormation stack `Devbox-<name>` (destroy uses the CFN API
 directly — no cdk toolchain needed).
+
+## Copying files and tunnels
+
+`copy` and `tun` reuse `ssh`'s route selection exactly (socks proxy
+`127.0.0.1:1055` when up, direct tailnet route otherwise) and the same key
+discovery, so they work everywhere `ssh` does — including Termux.
+
+- `copy <src> <dst>` is scp: exactly one side must be `<name>:<path>`
+  (either direction works). A local path that itself contains `:` must be
+  prefixed with `./` to disambiguate. `--show` prints the scp argv.
+- `tun <name> <local-port> <remote-port>` runs `ssh -N -L
+  <local>:127.0.0.1:<remote>`, i.e. it reaches services bound to the box's
+  loopback — which is also the only thing reachable at all: ufw on the box
+  only allows 22 in, so a tunnel is the intended way to reach a dev server.
+  Ctrl-C closes it. `--show` prints the ssh argv.
+- **Autostop applies regardless**: a long transfer or tunnel does not keep
+  the box alive past its `/etc/clouddevbox/autostop` uptime limit — raise it
+  first (`clouddevbox autostop <name> 10h`) for long sessions.
 
 ## Naming
 

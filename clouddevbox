@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -53,6 +53,9 @@ AUTOSTOP_RE = re.compile(r"^([0-9]+[hm]|off)$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 TYPE_RE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9]+$")
 PLUGIN_RE = re.compile(r"^[a-z0-9-]+$")
+# <name>:<path> in copy args; the name part is NAME_RE-shaped, so local
+# paths that merely contain a colon ('./odd:file', '/abs:path') stay local.
+REMOTE_RE = re.compile(r"^([a-z][a-z0-9-]{0,22}[a-z0-9]):(.*)$")
 
 LIVE_STATES = ["pending", "running", "stopping", "stopped", "shutting-down"]
 
@@ -785,38 +788,46 @@ def cmd_destroy(args, session, account):
     print(f"devbox '{args.name}' destroyed")
 
 
-def cmd_ssh(args, session, account):
-    if args.ssm:
-        return cmd_ssm(args, session, account)
+def tailnet_route(name, profile):
+    """Resolve devbox-<name> on the tailnet and pick the network path.
+    Returns (target, opts): the tailnet IP (or MagicDNS name) plus the
+    common ssh/scp option argv - deliberately without -l/user, because scp
+    reuses -l as a bandwidth limit; callers add the user themselves."""
     nodes = hs_nodes()
-    info = (nodes or {}).get(f"devbox-{args.name}")
+    info = (nodes or {}).get(f"devbox-{name}")
     if not info:
-        raise CliError(f"devbox-{args.name} is not on the tailnet"
+        raise CliError(f"devbox-{name} is not on the tailnet"
                        + ("" if nodes is not None else f" (headscale unreachable)")
                        + "; try: clouddevbox ssh --ssm")
     if not info["online"]:
-        raise CliError(f"devbox-{args.name} is offline (stopped?); "
-                       f"clouddevbox start {args.name} --profile {args.profile}")
-    target = info["ip"] or f"devbox-{args.name}.ts.gn.al"
+        raise CliError(f"devbox-{name} is offline (stopped?); "
+                       f"clouddevbox start {name} --profile {profile}")
+    target = info["ip"] or f"devbox-{name}.ts.gn.al"
     # Path selection: prefer the socks proxy (the Mac's only tailnet doorway,
     # at home or away); fall back to a direct connection for machines with a
     # native tailnet route (e.g. running this from one devbox to another).
     # Ephemeral boxes recycle tailnet IPs, so pinning host keys would break
     # every successor box; trusted-network no-verify combo per CLAUDE.md §4.2.
-    base = ["ssh",
-            "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
+    opts = ["-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no",
             "-o", "LogLevel=ERROR",
-            "-i", ssh_key(), "-l", VPS_USER]
+            "-i", ssh_key()]
     if _tcp_reachable(SOCKS_HOST, SOCKS_PORT, 1.5):
-        cmd = [*base, "-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p",
-               target, *args.command]
+        opts += ["-o", f"ProxyCommand=nc -x {SOCKS_HOST}:{SOCKS_PORT} %h %p"]
     elif info["ip"] and _tcp_reachable(info["ip"], 22, 3):
-        cmd = [*base, target, *args.command]
+        pass
     else:
-        raise CliError(f"no path to devbox-{args.name}: socks proxy "
+        raise CliError(f"no path to devbox-{name}: socks proxy "
                        f"{SOCKS_HOST}:{SOCKS_PORT} is down and {target}:22 is not "
                        f"directly reachable; start cn-socksnode "
-                       f"(~/dev/cn-socksnode/run.sh) or use: clouddevbox ssm {args.name}")
+                       f"(~/dev/cn-socksnode/run.sh) or use: clouddevbox ssm {name}")
+    return target, opts
+
+
+def cmd_ssh(args, session, account):
+    if args.ssm:
+        return cmd_ssm(args, session, account)
+    target, opts = tailnet_route(args.name, args.profile)
+    cmd = ["ssh", *opts, "-l", VPS_USER, target, *args.command]
     if getattr(args, "show", False):
         print("+ " + shlex.join(cmd))
     rc = subprocess.run(cmd).returncode
@@ -836,6 +847,43 @@ def cmd_ssm(args, session, account):
         print("+ " + shlex.join(cmd))
     rc = subprocess.run(cmd).returncode
     sys.exit(rc)
+
+
+def _split_remote(spec):
+    """(name, path) when spec looks like <name>:<path>, else None."""
+    m = REMOTE_RE.match(spec)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def cmd_copy(args, session, account):
+    src, dst = _split_remote(args.src), _split_remote(args.dst)
+    if bool(src) == bool(dst):
+        raise CliError("exactly one of src/dst must be <name>:<path> "
+                       "(e.g. clouddevbox copy report.txt alpha:/tmp/); "
+                       "prefix a local path containing ':' with ./")
+    name, rpath = src or dst
+    target, opts = tailnet_route(name, args.profile)
+    # scp reuses -l as a bandwidth limit, hence user@host instead of -l.
+    remote = f"{VPS_USER}@{target}:{rpath}"
+    cmd = (["scp", *opts, remote, args.dst] if src
+           else ["scp", *opts, args.src, remote])
+    if args.show:
+        print("+ " + shlex.join(cmd))
+    sys.exit(subprocess.run(cmd).returncode)
+
+
+def cmd_tun(args, session, account):
+    for port, which in ((args.local_port, "local"), (args.remote_port, "remote")):
+        if not 1 <= port <= 65535:
+            raise CliError(f"invalid {which} port {port} (1-65535)")
+    target, opts = tailnet_route(args.name, args.profile)
+    cmd = ["ssh", *opts, "-l", VPS_USER, "-N",
+           "-L", f"{args.local_port}:127.0.0.1:{args.remote_port}", target]
+    if args.show:
+        print("+ " + shlex.join(cmd))
+    print(f"tunnel open: localhost:{args.local_port} -> devbox-{args.name}:"
+          f"{args.remote_port} (ctrl-c to close; the box's autostop still applies)")
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_status(args, session, account):
@@ -937,6 +985,23 @@ def build_parser():
     p.add_argument("--show", action="store_true",
                    help="print the underlying aws command before connecting")
     p.set_defaults(fn=cmd_ssm)
+
+    p = sub.add_parser("copy", parents=[common],
+                       help="scp a file to/from a devbox (<name>:<path>)")
+    p.add_argument("src", help="local path or <name>:<path>")
+    p.add_argument("dst", help="local path or <name>:<path>")
+    p.add_argument("--show", action="store_true",
+                   help="print the underlying scp command before copying")
+    p.set_defaults(fn=cmd_copy)
+
+    p = sub.add_parser("tun", parents=[common],
+                       help="forward localhost:<local> to the devbox's 127.0.0.1:<remote>")
+    p.add_argument("name")
+    p.add_argument("local_port", type=int)
+    p.add_argument("remote_port", type=int)
+    p.add_argument("--show", action="store_true",
+                   help="print the underlying ssh command before connecting")
+    p.set_defaults(fn=cmd_tun)
 
     p = sub.add_parser("status", parents=[common], help="instance + tailnet + bootstrap state")
     p.add_argument("name")

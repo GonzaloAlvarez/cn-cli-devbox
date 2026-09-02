@@ -179,6 +179,106 @@ def test_ssh_errors_when_no_path():
 
 
 # ---------------------------------------------------------------------------
+# copy / tun (v1.5.0): shared tailnet route, scp argv, port validation
+# ---------------------------------------------------------------------------
+class _CopyArgs:
+    show = False
+    profile = "p"
+
+    def __init__(self, src, dst):
+        self.src, self.dst = src, dst
+
+
+class _TunArgs:
+    show = False
+    profile = "p"
+    name = "xb"
+
+    def __init__(self, local_port, remote_port):
+        self.local_port, self.remote_port = local_port, remote_port
+
+
+def _net_argv(fn, args, reachable):
+    """Run a connectivity command with stubbed probes; return its argv."""
+    saved = (cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run,
+             cdb._SSH_KEY_CACHE)
+    ran = []
+    try:
+        cdb._SSH_KEY_CACHE = "/fake/key.pem"
+        cdb.hs_nodes = lambda: {
+            "devbox-xb": {"id": "1", "online": True, "ip": "100.64.0.99",
+                         "last_seen": None}}
+        cdb._tcp_reachable = lambda h, p, t: reachable.get((h, p), False)
+        cdb.subprocess.run = (lambda cmd, **kw:
+                              (ran.append(cmd), type("R", (), {"returncode": 0})())[1])
+        try:
+            fn(args, None, None)
+        except SystemExit as e:
+            assert e.code == 0
+        return ran[0]
+    finally:
+        (cdb.hs_nodes, cdb._tcp_reachable, cdb.subprocess.run,
+         cdb._SSH_KEY_CACHE) = saved
+
+
+def test_split_remote():
+    assert cdb._split_remote("xb:/tmp/f") == ("xb", "/tmp/f")
+    assert cdb._split_remote("alpha:") == ("alpha", "")
+    assert cdb._split_remote("my-box-2:rel/path") == ("my-box-2", "rel/path")
+    for local in ("./a:b", "/abs:p", "plain", "Abc:/x", "a:/x"):
+        assert cdb._split_remote(local) is None, local
+
+
+def test_copy_local_to_remote_uses_proxy():
+    cmd = _net_argv(cdb.cmd_copy, _CopyArgs("report.txt", "xb:/tmp/f"),
+                    {(cdb.SOCKS_HOST, cdb.SOCKS_PORT): True})
+    assert cmd[0] == "scp"
+    assert any("ProxyCommand" in a for a in cmd)
+    assert "-l" not in cmd
+    assert cmd[-2:] == ["report.txt", f"{cdb.VPS_USER}@100.64.0.99:/tmp/f"]
+
+
+def test_copy_remote_to_local_direct_route():
+    cmd = _net_argv(cdb.cmd_copy, _CopyArgs("xb:/var/log/syslog", "out.log"),
+                    {("100.64.0.99", 22): True})
+    assert cmd[0] == "scp"
+    assert not any("ProxyCommand" in a for a in cmd)
+    assert cmd[-2:] == [f"{cdb.VPS_USER}@100.64.0.99:/var/log/syslog", "out.log"]
+
+
+def test_copy_requires_exactly_one_remote():
+    import pytest
+    for src, dst in (("a.txt", "b.txt"), ("xb:/a", "xb:/b")):
+        with pytest.raises(cdb.CliError, match="exactly one"):
+            cdb.cmd_copy(_CopyArgs(src, dst), None, None)
+
+
+def test_tun_argv_and_banner(capsys):
+    cmd = _net_argv(cdb.cmd_tun, _TunArgs(8080, 8000),
+                    {(cdb.SOCKS_HOST, cdb.SOCKS_PORT): True})
+    assert cmd[0] == "ssh" and "-N" in cmd
+    assert cmd[cmd.index("-L") + 1] == "8080:127.0.0.1:8000"
+    assert cmd[cmd.index("-l") + 1] == cdb.VPS_USER
+    assert cmd[-1] == "100.64.0.99"
+    assert "tunnel open: localhost:8080 -> devbox-xb:8000" in capsys.readouterr().out
+
+
+def test_tun_port_validation():
+    import pytest
+    for lp, rp in ((0, 80), (8080, 70000)):
+        with pytest.raises(cdb.CliError, match="invalid .* port"):
+            cdb.cmd_tun(_TunArgs(lp, rp), None, None)
+
+
+def test_parser_copy_tun():
+    args = cdb.build_parser().parse_args(["copy", "xb:/a", "b", "--profile", "p"])
+    assert args.fn is cdb.cmd_copy and (args.src, args.dst) == ("xb:/a", "b")
+    args = cdb.build_parser().parse_args(["tun", "xb", "8080", "80"])
+    assert args.fn is cdb.cmd_tun
+    assert (args.local_port, args.remote_port) == (8080, 80)
+
+
+# ---------------------------------------------------------------------------
 # ssh key resolution: email-tagged ~/.ssh candidates -> probe -> kauket ssh.*
 # ---------------------------------------------------------------------------
 import subprocess
