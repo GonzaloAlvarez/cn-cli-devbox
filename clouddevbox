@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -51,13 +51,23 @@ CDK_REPO_URL = "https://github.com/GonzaloAlvarez/cn-cdk-devbox"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,22}[a-z0-9]$")
 AUTOSTOP_RE = re.compile(r"^([0-9]+[hm]|off)$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
-TYPE_RE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9]+$")
+TYPE_RE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9-]+$")  # size may hyphenate (metal-24xl)
+FAMILY_RE = re.compile(r"^([a-z]+)([0-9]+)([a-z-]*)$")
 PLUGIN_RE = re.compile(r"^[a-z0-9-]+$")
 # <name>:<path> in copy args; the name part is NAME_RE-shaped, so local
 # paths that merely contain a colon ('./odd:file', '/abs:path') stay local.
 REMOTE_RE = re.compile(r"^([a-z][a-z0-9-]{0,22}[a-z0-9]):(.*)$")
 
 LIVE_STATES = ["pending", "running", "stopping", "stopped", "shutting-down"]
+
+DEFAULT_TYPE = "m7g.large"
+KVM_DEFAULT_TYPE = "m7i.large"
+# Families supporting nested virtualization on virtual instances (AWS,
+# Feb 2026 - all Intel x86; Graviton cannot nest). .metal types expose
+# /dev/kvm natively and are handled separately.
+KVM_FAMILIES = {"c7i", "c7i-flex", "m7i", "m7i-flex", "r7i", "i7i",
+                "c8i", "c8i-flex", "m8i", "m8i-flex", "r8i", "r8i-flex",
+                "c8id", "m8id", "r8id", "x8i"}
 
 WORKDIR = Path.cwd() / ".clouddevbox"
 
@@ -592,14 +602,106 @@ def humanize_age(launch_time):
 
 
 # ---------------------------------------------------------------------------
+# kvm (nested virtualization)
+# ---------------------------------------------------------------------------
+def is_metal(itype):
+    return itype.partition(".")[2].startswith("metal")
+
+
+def kvm_supported(itype):
+    return is_metal(itype) or itype.partition(".")[0] in KVM_FAMILIES
+
+
+def type_arch(itype):
+    """EC2 Architecture vocabulary (arm64/x86_64) from the family: a 'g' in
+    the letters after the generation digit means Graviton - the mirror of
+    cn-cdk-devbox's instance_arch, but comparable to describe_instances."""
+    m = FAMILY_RE.match(itype.partition(".")[0])
+    if not m:
+        raise CliError(f"unrecognized instance family in '{itype}'")
+    return "arm64" if "g" in m.group(3) else "x86_64"
+
+
+def kvm_state(instance):
+    """'enabled' / 'enabled (bare metal)' / 'disabled' from describe data."""
+    if is_metal(instance["InstanceType"]):
+        return "enabled (bare metal)"
+    cpu = instance.get("CpuOptions", {})
+    return "enabled" if cpu.get("NestedVirtualization") == "enabled" else "disabled"
+
+
+def _boto_errors():
+    import botocore.exceptions as bex
+    return bex.ClientError, bex.ParamValidationError
+
+
+def modify_nested_virt(session, iid, value):
+    """Flip CpuOptions.NestedVirtualization on a stopped instance, echoing
+    back the current CoreCount/ThreadsPerCore (the API requires them).
+    Retries InvalidParameterValue: CpuOptions can lag for a few seconds
+    right after an instance-type change."""
+    client_error, param_error = _boto_errors()
+    ec2 = session.client("ec2")
+    for attempt in range(3):
+        cpu = ec2.describe_instances(InstanceIds=[iid])[
+            "Reservations"][0]["Instances"][0].get("CpuOptions", {})
+        try:
+            ec2.modify_instance_cpu_options(
+                InstanceId=iid, CoreCount=cpu["CoreCount"],
+                ThreadsPerCore=cpu["ThreadsPerCore"],
+                NestedVirtualization=value)
+            return
+        except (AttributeError, param_error):
+            raise CliError("this boto3/botocore is too old for "
+                           "NestedVirtualization (needs boto3 >= 1.42.48); "
+                           "re-run clouddevbox outside any pre-existing venv "
+                           "(its bootstrap installs a fresh boto3) or upgrade")
+        except client_error as e:
+            if (e.response.get("Error", {}).get("Code") != "InvalidParameterValue"
+                    or attempt == 2):
+                raise CliError(f"could not set nested virtualization: {e}")
+            time.sleep(5)
+
+
+def ensure_kvm_enabled(session, name, iid):
+    """Post-deploy guard for `new --kvm`: a cn-cdk-devbox checkout that
+    predates the kvm context silently ignores it - verify, and heal in place
+    (stop -> modify cpu options -> start), the only way to change CpuOptions."""
+    ec2 = session.client("ec2")
+    i = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+    if i.get("CpuOptions", {}).get("NestedVirtualization") == "enabled":
+        print("nested virtualization confirmed enabled")
+        return
+    print("warning: the deployed instance has nested virtualization DISABLED - "
+          "the cn-cdk-devbox checkout likely predates the kvm context "
+          "(git -C ~/dev/cn-cdk-devbox pull); healing in place...", file=sys.stderr)
+    print(f"stopping {iid} to change cpu options...")
+    ec2.stop_instances(InstanceIds=[iid])
+    ec2.get_waiter("instance_stopped").wait(InstanceIds=[iid])
+    modify_nested_virt(session, iid, "enabled")
+    print(f"nested virtualization enabled; starting {iid}...")
+    ec2.start_instances(InstanceIds=[iid])
+    ec2.get_waiter("instance_running").wait(InstanceIds=[iid])
+    print("waiting for the tailnet...")
+    wait_tailnet_online(name, timeout=300)
+    print("nested virtualization enabled (healed post-deploy)")
+
+
+# ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
 def cmd_new(args, session, account):
     name = args.name
     if not NAME_RE.match(name) or name == "base":
         raise CliError(f"invalid name '{name}': lowercase alphanumeric + dashes, 2-24 chars")
+    if args.type is None:
+        args.type = KVM_DEFAULT_TYPE if args.kvm else DEFAULT_TYPE
     if not TYPE_RE.match(args.type):
         raise CliError(f"invalid instance type '{args.type}'")
+    if args.kvm and not kvm_supported(args.type):
+        raise CliError(f"--kvm is not supported on '{args.type}': Graviton/older "
+                       f"families cannot nest; use an x86 7i/8i-generation type or "
+                       f"a .metal type (e.g. --type {KVM_DEFAULT_TYPE})")
     if not 8 <= args.disk <= 2000:
         raise CliError(f"invalid disk size {args.disk} GiB (8-2000)")
     if not AUTOSTOP_RE.match(args.autostop):
@@ -639,11 +741,14 @@ def cmd_new(args, session, account):
     ssm.put_parameter(Name=param, Value=key, Type="SecureString", Overwrite=True)
     print(f"staged key at SSM parameter {param}")
 
+    context = {"box": name, "type": args.type, "disk": str(args.disk),
+               "plugins": ",".join(plugins), "autostop": args.autostop}
+    if args.kvm:
+        # only when set: keeps non-kvm boxes deployable from a pre-kvm checkout
+        context["kvm"] = "1"
     try:
-        cdk_deploy(repo, args.profile, account, ["DevboxBase", f"Devbox-{name}"], {
-            "box": name, "type": args.type, "disk": str(args.disk),
-            "plugins": ",".join(plugins), "autostop": args.autostop,
-        })
+        cdk_deploy(repo, args.profile, account,
+                   ["DevboxBase", f"Devbox-{name}"], context)
         _, _, stack = stack_status(cfn, name)
         iid = stack_output(stack, "instanceid")
         if not iid:
@@ -654,6 +759,8 @@ def cmd_new(args, session, account):
         wait_ssm_online(session, iid)
         print("waiting for the box to join the tailnet...")
         info = wait_tailnet_online(name)
+        if args.kvm and not is_metal(args.type):
+            ensure_kvm_enabled(session, name, iid)
     finally:
         try:
             ssm.delete_parameter(Name=param)
@@ -672,7 +779,10 @@ devbox '{name}' is up
               (socks proxy 127.0.0.1:1055 must be up: ~/dev/cn-socksnode/run.sh)
   ssm:        clouddevbox ssm {name} --profile {args.profile}
               (lands as ssm-user; sudo su - gonzalo)
-  autostop:   {args.autostop} after each boot (clouddevbox autostop {name} 10h|off)
+  autostop:   {args.autostop} after each boot (clouddevbox autostop {name} 10h|off)"""
+          + (f"""
+  kvm:        nested virtualization enabled ({args.type}; /dev/kvm on the box)"""
+             if args.kvm else "") + f"""
   note:       amun bootstrap keeps running ~5-8 min after the tailnet join;
               clouddevbox status {name} --profile {args.profile} shows completion""")
 
@@ -788,6 +898,70 @@ def cmd_destroy(args, session, account):
     print(f"devbox '{args.name}' destroyed")
 
 
+def cmd_kvm_enable(args, session, account):
+    i = _require_instance(session, args.name)
+    iid, itype, state = i["InstanceId"], i["InstanceType"], i["State"]["Name"]
+    if is_metal(itype):
+        print(f"'{args.name}' is {itype}: bare metal exposes /dev/kvm natively; "
+              f"nothing to do")
+        return
+    if i.get("Architecture") == "arm64":
+        raise CliError(f"'{args.name}' is Graviton ({itype}) and arm64 cannot nest "
+                       f"on EC2 (and the AMI pins the arch, so the type cannot "
+                       f"cross either); create an x86 box instead: "
+                       f"clouddevbox new <name> --kvm --profile {args.profile}")
+    if not args.type and not kvm_supported(itype):
+        raise CliError(f"family '{itype.split('.')[0]}' does not support nested "
+                       f"virtualization; switch the type too: "
+                       f"clouddevbox kvm enable {args.name} --type {KVM_DEFAULT_TYPE}")
+    if state != "stopped":
+        raise CliError(f"devbox '{args.name}' is {state}; cpu options can only "
+                       f"change while stopped - run: "
+                       f"clouddevbox stop {args.name} --profile {args.profile}")
+    if args.type:
+        if not TYPE_RE.match(args.type):
+            raise CliError(f"invalid instance type '{args.type}'")
+        if not kvm_supported(args.type) or is_metal(args.type):
+            raise CliError(f"--type must be an x86 7i/8i-generation virtual type "
+                           f"(e.g. {KVM_DEFAULT_TYPE})")
+        if type_arch(args.type) != i.get("Architecture", "x86_64"):
+            raise CliError(f"'{args.type}' is {type_arch(args.type)} but the "
+                           f"box's AMI is {i.get('Architecture')}; instance types "
+                           f"cannot cross architectures")
+        ec2 = session.client("ec2")
+        print(f"switching {iid} to {args.type} (drifts from the CloudFormation "
+              f"template - accepted: boxes are never redeployed)...")
+        ec2.modify_instance_attribute(InstanceId=iid,
+                                      InstanceType={"Value": args.type})
+        itype = args.type
+    elif kvm_state(i) == "enabled":
+        print(f"'{args.name}' already has nested virtualization enabled")
+        return
+    modify_nested_virt(session, iid, "enabled")
+    print(f"nested virtualization enabled on '{args.name}' ({itype}); start it "
+          f"and check: clouddevbox start {args.name} --profile {args.profile}; "
+          f"then: ls -l /dev/kvm")
+
+
+def cmd_kvm_disable(args, session, account):
+    i = _require_instance(session, args.name)
+    iid, itype, state = i["InstanceId"], i["InstanceType"], i["State"]["Name"]
+    if is_metal(itype):
+        print(f"'{args.name}' is {itype}: bare metal always exposes /dev/kvm; "
+              f"nothing to disable (change the instance type to turn it off)")
+        return
+    if kvm_state(i) == "disabled":
+        print(f"'{args.name}' already has nested virtualization disabled")
+        return
+    if state != "stopped":
+        raise CliError(f"devbox '{args.name}' is {state}; cpu options can only "
+                       f"change while stopped - run: "
+                       f"clouddevbox stop {args.name} --profile {args.profile}")
+    modify_nested_virt(session, iid, "disabled")
+    print(f"nested virtualization disabled on '{args.name}' (instance type "
+          f"{itype} unchanged)")
+
+
 def tailnet_route(name, profile):
     """Resolve devbox-<name> on the tailnet and pick the network path.
     Returns (target, opts): the tailnet IP (or MagicDNS name) plus the
@@ -890,6 +1064,7 @@ def cmd_status(args, session, account):
     i = _require_instance(session, args.name)
     state = i["State"]["Name"]
     print(f"instance:  {i['InstanceId']} ({i['InstanceType']}) - {state}")
+    print(f"kvm:       {kvm_state(i)}")
     nodes = hs_nodes()
     node = (nodes or {}).get(f"devbox-{args.name}")
     if nodes is None:
@@ -943,7 +1118,12 @@ def build_parser():
 
     p = sub.add_parser("new", parents=[common], help="create a devbox")
     p.add_argument("name")
-    p.add_argument("--type", default="m7g.large", help="EC2 instance type (default m7g.large)")
+    p.add_argument("--type", default=None,
+                   help=f"EC2 instance type (default {DEFAULT_TYPE}; "
+                        f"{KVM_DEFAULT_TYPE} with --kvm)")
+    p.add_argument("--kvm", action="store_true",
+                   help="enable nested virtualization (/dev/kvm; "
+                        "x86 7i/8i-generation or .metal types only)")
     p.add_argument("--disk", type=int, default=50, help="root gp3 GiB (default 50)")
     p.add_argument("--plugins", default="kauket",
                    help="comma-separated amun plugins after core (default: kauket)")
@@ -985,6 +1165,20 @@ def build_parser():
     p.add_argument("--show", action="store_true",
                    help="print the underlying aws command before connecting")
     p.set_defaults(fn=cmd_ssm)
+
+    p = sub.add_parser("kvm", help="nested virtualization (/dev/kvm) on an existing box")
+    kvm_sub = p.add_subparsers(dest="kvm_cmd", required=True)
+    q = kvm_sub.add_parser("enable", parents=[common],
+                           help="enable nested virtualization (box must be stopped)")
+    q.add_argument("name")
+    q.add_argument("--type",
+                   help=f"switch the instance type first (e.g. {KVM_DEFAULT_TYPE}; "
+                        f"same architecture only)")
+    q.set_defaults(fn=cmd_kvm_enable)
+    q = kvm_sub.add_parser("disable", parents=[common],
+                           help="disable nested virtualization (box must be stopped)")
+    q.add_argument("name")
+    q.set_defaults(fn=cmd_kvm_disable)
 
     p = sub.add_parser("copy", parents=[common],
                        help="scp a file to/from a devbox (<name>:<path>)")

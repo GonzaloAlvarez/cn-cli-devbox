@@ -64,6 +64,9 @@ deletes it on exit — amun-style, nothing persists between runs
 clouddevbox new alpha --profile personal              # m7g.large, 50 GB, 6h autostop
 clouddevbox new beta  --profile personal --type m7g.xlarge --disk 100 \
                       --plugins kauket,docker --autostop 10h
+clouddevbox new kvmbox --profile personal --kvm       # nested virt; defaults to m7i.large
+clouddevbox kvm enable kvmbox --profile personal      # existing STOPPED box (x86 7i/8i only)
+clouddevbox kvm disable kvmbox --profile personal
 clouddevbox list --profile personal
 clouddevbox list                                      # no --profile: interactive picker
 clouddevbox ssh alpha --profile personal              # tailnet, via socks proxy
@@ -84,6 +87,32 @@ clouddevbox destroy alpha --profile personal          # stack + node + params, c
 (`devbox:name`, `devbox:managed-by=clouddevbox`); `new` and `destroy` operate
 on the CloudFormation stack `Devbox-<name>` (destroy uses the CFN API
 directly — no cdk toolchain needed).
+
+## KVM (nested virtualization)
+
+AWS supports nested virtualization on *virtual* instances (Feb 2026) via
+`CpuOptions.NestedVirtualization` — but only on Intel x86 7i/8i-generation
+families (`c7i`, `m7i`, `r7i`, `i7i`, the `8i` twins, their `-flex`/`d`
+variants and `x8i`). **Graviton cannot nest**, and an existing box's
+architecture is pinned by its AMI, so a stock `m7g.large` box can never be
+KVM-enabled — create an x86 one instead.
+
+- `new <name> --kvm` defaults the type to `m7i.large` (the x86 twin of
+  `m7g.large`, ≈$0.10/h vs ≈$0.082/h) and enables nested virtualization at
+  launch (via the launch template in cn-cdk-devbox). After the deploy the CLI
+  verifies the flag on the instance and, if a stale cn-cdk-devbox checkout
+  ignored it, heals in place (stop → modify cpu options → start).
+- `kvm enable <name>` / `kvm disable <name>` toggle it on an existing box —
+  the box must be **stopped** (an EC2 requirement for CPU options).
+  `kvm enable --type m7i.large` also switches an unsupported x86 type first
+  (same architecture only). The type change drifts from the CloudFormation
+  template — accepted, since boxes are never redeployed.
+- `status <name>` shows a `kvm:` line in every instance state; `.metal`
+  types report `enabled (bare metal)`.
+- The CLI only provides the hardware: once the box runs, `/dev/kvm` exists
+  (Debian autoloads `kvm_intel`). Install your own stack, e.g.
+  `sudo apt-get install -y qemu-system-x86 libvirt-daemon-system` (an amun
+  plugin for this is future work).
 
 ## Copying files and tunnels
 
@@ -164,6 +193,7 @@ it persists across stop/start.
 | State | Cost |
 |---|---|
 | running m7g.large | ≈ $0.082/h |
+| running m7i.large (`--kvm` default) | ≈ $0.10/h |
 | stopped | EBS only, ≈ $0.08/GB·mo (≈$4/mo at 50 GB) |
 | destroyed | $0 |
 | shared base (VPC/SG/role) | $0 (no NAT, no EIP) |

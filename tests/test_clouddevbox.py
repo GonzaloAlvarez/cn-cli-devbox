@@ -144,6 +144,7 @@ def test_new_stale_node_suggests_destroy(monkeypatch):
         name = "dev1"
         profile = "p"
         type = "m7g.large"
+        kvm = False
         disk = 50
         autostop = "6h"
         plugins = "kauket"
@@ -503,3 +504,302 @@ def test_select_profile_launches_bullet(monkeypatch):
                         types.SimpleNamespace(Bullet=FakeBullet))
     assert cdb.select_profile() == "work"
     assert captured["choices"] == ["personal", "work"]
+
+
+# ---------------------------------------------------------------------------
+# kvm / nested virtualization (v1.6.0)
+# ---------------------------------------------------------------------------
+def test_type_re_metal_sizes():
+    for t in ["c7i-flex.large", "i7i.metal-24xl", "m8id.2xlarge",
+              "m7i.metal-48xl", "m7g.metal", "m7i.large"]:
+        assert cdb.TYPE_RE.match(t), t
+    for t in ["M7i.large", "m7i.", ".large", "m7i", ""]:
+        assert not cdb.TYPE_RE.match(t), t
+
+
+def test_kvm_supported_and_arch():
+    for t in ["m7i.large", "c7i-flex.xlarge", "x8i.large", "m8id.2xlarge",
+              "c7i.metal-24xl", "m7g.metal"]:
+        assert cdb.kvm_supported(t), t
+    for t in ["m7g.large", "m5.large", "t4g.small"]:
+        assert not cdb.kvm_supported(t), t
+    assert cdb.type_arch("m7g.large") == "arm64"
+    assert cdb.type_arch("t4g.small") == "arm64"
+    for t in ["i7i.xlarge", "c7i-flex.large", "m8id.large", "m7i.large"]:
+        assert cdb.type_arch(t) == "x86_64", t
+
+
+def _instance(itype="m7i.large", state="stopped", arch="x86_64",
+              nested="disabled"):
+    return {"InstanceId": "i-123", "InstanceType": itype,
+            "State": {"Name": state}, "Architecture": arch,
+            "CpuOptions": {"CoreCount": 1, "ThreadsPerCore": 2,
+                           "NestedVirtualization": nested}}
+
+
+def test_kvm_state():
+    assert cdb.kvm_state(_instance(nested="enabled")) == "enabled"
+    assert cdb.kvm_state(_instance()) == "disabled"
+    assert cdb.kvm_state(_instance(itype="m7g.metal")) == "enabled (bare metal)"
+    assert cdb.kvm_state({"InstanceType": "m5.large"}) == "disabled"  # no CpuOptions
+
+
+class _FakeEc2:
+    def __init__(self, instance):
+        self.instance, self.calls = instance, []
+
+    def describe_instances(self, **kw):
+        self.calls.append(("describe_instances", kw))
+        return {"Reservations": [{"Instances": [self.instance]}]}
+
+    def modify_instance_attribute(self, **kw):
+        self.calls.append(("modify_instance_attribute", kw))
+        self.instance["InstanceType"] = kw["InstanceType"]["Value"]
+
+    def modify_instance_cpu_options(self, **kw):
+        self.calls.append(("modify_instance_cpu_options", kw))
+        self.instance["CpuOptions"]["NestedVirtualization"] = \
+            kw["NestedVirtualization"]
+
+    def stop_instances(self, **kw):
+        self.calls.append(("stop_instances", kw))
+
+    def start_instances(self, **kw):
+        self.calls.append(("start_instances", kw))
+
+    def get_waiter(self, name):
+        self.calls.append(("get_waiter", name))
+        return type("W", (), {"wait": lambda s, **kw: None})()
+
+
+class _FakeSession:
+    def __init__(self, ec2):
+        self._ec2 = ec2
+
+    def client(self, name):
+        return self._ec2
+
+
+class _KvmArgs:
+    profile = "p"
+    name = "xb"
+    type = None
+
+
+def _kvm_setup(monkeypatch, instance):
+    ec2 = _FakeEc2(instance)
+    monkeypatch.setattr(cdb, "_require_instance",
+                        lambda session, name, states=None: instance)
+    monkeypatch.setattr(cdb, "_boto_errors",
+                        lambda: (type("CE", (Exception,), {}),
+                                 type("PE", (Exception,), {})))
+    return ec2, _FakeSession(ec2)
+
+
+def test_kvm_enable_requires_stopped(monkeypatch):
+    import pytest
+    _, session = _kvm_setup(monkeypatch, _instance(state="running"))
+    with pytest.raises(cdb.CliError, match="clouddevbox stop xb --profile p"):
+        cdb.cmd_kvm_enable(_KvmArgs(), session, "1")
+
+
+def test_kvm_enable_arm_errors(monkeypatch):
+    import pytest
+    _, session = _kvm_setup(monkeypatch, _instance(itype="m7g.large", arch="arm64"))
+    with pytest.raises(cdb.CliError, match="--kvm"):
+        cdb.cmd_kvm_enable(_KvmArgs(), session, "1")
+
+
+def test_kvm_enable_unsupported_family_hint(monkeypatch):
+    import pytest
+    _, session = _kvm_setup(monkeypatch, _instance(itype="m5.large"))
+    with pytest.raises(cdb.CliError, match="--type m7i.large"):
+        cdb.cmd_kvm_enable(_KvmArgs(), session, "1")
+
+
+def test_kvm_enable(monkeypatch):
+    ec2, session = _kvm_setup(monkeypatch, _instance())
+    cdb.cmd_kvm_enable(_KvmArgs(), session, "1")
+    mods = [c for c in ec2.calls if c[0] == "modify_instance_cpu_options"]
+    assert len(mods) == 1
+    assert mods[0][1] == {"InstanceId": "i-123", "CoreCount": 1,
+                          "ThreadsPerCore": 2, "NestedVirtualization": "enabled"}
+
+
+def test_kvm_enable_with_type_switch(monkeypatch):
+    class Args(_KvmArgs):
+        type = "m7i.large"
+
+    ec2, session = _kvm_setup(monkeypatch, _instance(itype="m5.large"))
+    cdb.cmd_kvm_enable(Args(), session, "1")
+    ops = [c[0] for c in ec2.calls
+           if c[0].startswith("modify")]
+    assert ops == ["modify_instance_attribute", "modify_instance_cpu_options"]
+    attr = next(c[1] for c in ec2.calls if c[0] == "modify_instance_attribute")
+    assert attr["InstanceType"] == {"Value": "m7i.large"}
+
+
+def test_kvm_enable_already_enabled(monkeypatch, capsys):
+    ec2, session = _kvm_setup(monkeypatch, _instance(nested="enabled"))
+    cdb.cmd_kvm_enable(_KvmArgs(), session, "1")
+    assert "already" in capsys.readouterr().out
+    assert not any(c[0].startswith("modify") for c in ec2.calls)
+
+
+def test_kvm_enable_metal_noop(monkeypatch, capsys):
+    ec2, session = _kvm_setup(monkeypatch,
+                              _instance(itype="c7i.metal-24xl", state="running"))
+    cdb.cmd_kvm_enable(_KvmArgs(), session, "1")
+    assert "bare metal" in capsys.readouterr().out
+    assert not ec2.calls
+
+
+def test_kvm_disable(monkeypatch):
+    ec2, session = _kvm_setup(monkeypatch, _instance(nested="enabled"))
+    cdb.cmd_kvm_disable(_KvmArgs(), session, "1")
+    mods = [c for c in ec2.calls if c[0] == "modify_instance_cpu_options"]
+    assert mods[0][1]["NestedVirtualization"] == "disabled"
+
+
+def test_new_kvm_default_type_and_context(monkeypatch):
+    import pytest
+
+    class Args:
+        name = "kb1"
+        profile = "p"
+        type = None
+        kvm = True
+        disk = 50
+        autostop = "6h"
+        plugins = "kauket"
+
+    class Boom(Exception):
+        pass
+
+    class Ssm:
+        def put_parameter(self, **kw):
+            pass
+
+        def delete_parameter(self, **kw):
+            pass
+
+    class Session:
+        def client(self, name):
+            return Ssm()
+
+    recorded = {}
+
+    def fake_deploy(repo, profile, account, stacks, context):
+        recorded.update(context)
+        raise Boom()
+
+    monkeypatch.setattr(cdb, "find_instance", lambda ec2, name, states=None: None)
+    monkeypatch.setattr(cdb, "stack_status", lambda cfn, name: (None, None, None))
+    monkeypatch.setattr(cdb, "hs_nodes", lambda: {})
+    monkeypatch.setattr(cdb, "resolve_cdk_repo", lambda: "/tmp/fake-repo")
+    monkeypatch.setattr(cdb, "hs_mint_key", lambda: "hskey-auth-v-" + "a" * 40)
+    monkeypatch.setattr(cdb, "cdk_deploy", fake_deploy)
+    a = Args()
+    with pytest.raises(Boom):
+        cdb.cmd_new(a, Session(), "123456789012")
+    assert a.type == "m7i.large"
+    assert recorded["type"] == "m7i.large" and recorded["kvm"] == "1"
+
+
+def test_new_kvm_rejects_graviton_type():
+    import pytest
+
+    class Args:
+        name = "kb1"
+        profile = "p"
+        type = "m7g.large"
+        kvm = True
+
+    with pytest.raises(cdb.CliError, match="m7i.large"):
+        cdb.cmd_new(Args(), None, "123456789012")
+
+
+def test_new_without_kvm_omits_context(monkeypatch):
+    import pytest
+
+    class Args:
+        name = "kb1"
+        profile = "p"
+        type = None
+        kvm = False
+        disk = 50
+        autostop = "6h"
+        plugins = "kauket"
+
+    class Boom(Exception):
+        pass
+
+    class Ssm:
+        def put_parameter(self, **kw):
+            pass
+
+        def delete_parameter(self, **kw):
+            pass
+
+    class Session:
+        def client(self, name):
+            return Ssm()
+
+    recorded = {}
+
+    def fake_deploy(repo, profile, account, stacks, context):
+        recorded.update(context)
+        raise Boom()
+
+    monkeypatch.setattr(cdb, "find_instance", lambda ec2, name, states=None: None)
+    monkeypatch.setattr(cdb, "stack_status", lambda cfn, name: (None, None, None))
+    monkeypatch.setattr(cdb, "hs_nodes", lambda: {})
+    monkeypatch.setattr(cdb, "resolve_cdk_repo", lambda: "/tmp/fake-repo")
+    monkeypatch.setattr(cdb, "hs_mint_key", lambda: "hskey-auth-v-" + "a" * 40)
+    monkeypatch.setattr(cdb, "cdk_deploy", fake_deploy)
+    a = Args()
+    with pytest.raises(Boom):
+        cdb.cmd_new(a, Session(), "123456789012")
+    assert a.type == "m7g.large"
+    assert "kvm" not in recorded
+
+
+def test_ensure_kvm_heals(monkeypatch):
+    ec2, session = _kvm_setup(monkeypatch, _instance())
+    monkeypatch.setattr(cdb, "wait_tailnet_online",
+                        lambda name, timeout=300: {"ip": "100.64.0.99"})
+    cdb.ensure_kvm_enabled(session, "xb", "i-123")
+    ops = [c[0] for c in ec2.calls if c[0] != "describe_instances"
+           and c[0] != "get_waiter"]
+    assert ops == ["stop_instances", "modify_instance_cpu_options",
+                   "start_instances"]
+
+
+def test_ensure_kvm_noop_when_enabled(monkeypatch, capsys):
+    ec2, session = _kvm_setup(monkeypatch, _instance(nested="enabled"))
+    cdb.ensure_kvm_enabled(session, "xb", "i-123")
+    assert "confirmed enabled" in capsys.readouterr().out
+    assert [c[0] for c in ec2.calls] == ["describe_instances"]
+
+
+def test_status_kvm_line(monkeypatch, capsys):
+    for inst, expect in ((_instance(nested="enabled"), "kvm:       enabled"),
+                         (_instance(), "kvm:       disabled"),
+                         (_instance(itype="m7g.metal"),
+                          "kvm:       enabled (bare metal)")):
+        monkeypatch.setattr(cdb, "_require_instance",
+                            lambda session, name, states=None, i=inst: i)
+        monkeypatch.setattr(cdb, "hs_nodes", lambda: None)
+        cdb.cmd_status(_KvmArgs(), None, "1")
+        assert expect in capsys.readouterr().out
+
+
+def test_parser_kvm():
+    args = cdb.build_parser().parse_args(
+        ["kvm", "enable", "xb", "--type", "m7i.large", "--profile", "p"])
+    assert args.fn is cdb.cmd_kvm_enable
+    assert args.name == "xb" and args.type == "m7i.large"
+    args = cdb.build_parser().parse_args(["kvm", "disable", "xb"])
+    assert args.fn is cdb.cmd_kvm_disable
+    args = cdb.build_parser().parse_args(["new", "kb1", "--kvm"])
+    assert args.kvm is True and args.type is None
