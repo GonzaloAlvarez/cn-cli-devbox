@@ -213,6 +213,20 @@ it persists across stop/start.
 - Never `cdk deploy` an existing box from a fresh checkout — see the
   AMI-drift warning in the cn-cdk-devbox README (instance replacement).
 
+## Verification
+
+- Unit tests (no AWS, no network):
+  `python3 -m venv /tmp/cdb-test && /tmp/cdb-test/bin/pip install -q pytest
+  && /tmp/cdb-test/bin/pytest -q tests/`
+- **`./e2e --profile <p>`** — the full billable end-to-end: creates an
+  `e2ekvm` box with `--kvm` (m7i.large, ≈$0.10/h, ~30 min run), waits for
+  full provisioning, installs qemu + cpu-checker, proves KVM works
+  (`kvm-ok`, `/dev/kvm`, a KVM-accelerated qemu boot), round-trips a file
+  with `copy`, curls through a `tun` tunnel, checks port 22 on the public IP
+  times out (zero-ingress invariant), cycles `kvm disable`/`enable` on the
+  stopped box, and destroys everything via an EXIT trap (also on failure).
+  `--keep` preserves the box for debugging, `--yes` skips the cost prompt.
+
 ## Termux (Android)
 
 Works on Termux — gear installs it via `~/.gear/run clouddevbox` (which

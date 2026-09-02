@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# cn-cli-devbox end-to-end harness: creates a REAL (billable) devbox with
+# --kvm, deploys qemu, proves /dev/kvm works, exercises copy/tun and the
+# kvm enable/disable cycle, then tears everything down.
+#
+#   ./e2e --profile <aws-profile> [--yes] [--keep]
+#
+# Cost: one m7i.large (~$0.10/h) for the ~20-30 min run, destroyed at the
+# end (trap-based, also on failure) unless --keep. Uses the WORKING-TREE
+# ./clouddevbox, not the gear-installed one.
+set -u
+
+cd "$(dirname "$0")"
+CDB=./clouddevbox
+BOX=e2ekvm
+PROFILE="" KEEP=0 YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) PROFILE="$2"; shift 2 ;;
+    --keep)    KEEP=1; shift ;;
+    --yes)     YES=1; shift ;;
+    *) echo "usage: ./e2e --profile <aws-profile> [--yes] [--keep]" >&2; exit 2 ;;
+  esac
+done
+[ -n "$PROFILE" ] || { echo "e2e: --profile is required" >&2; exit 2; }
+
+log()  { echo "$(date '+%H:%M:%S') [e2e] $*"; }
+fail() { echo "$(date '+%H:%M:%S') [e2e] FAIL: $*" >&2; exit 1; }
+
+CREATED=0
+cleanup() {
+  rc=$?
+  [ "${TUN_PID:-}" ] && kill "$TUN_PID" 2>/dev/null
+  pkill -f "ssh.*-L 18080:127.0.0.1:8000" 2>/dev/null
+  if [ "$CREATED" = 1 ] && [ "$KEEP" = 0 ]; then
+    log "tearing down: destroying $BOX..."
+    "$CDB" destroy "$BOX" --yes --profile "$PROFILE" || \
+      echo "[e2e] WARNING: destroy failed - clean up manually: $CDB destroy $BOX --profile $PROFILE" >&2
+  elif [ "$CREATED" = 1 ]; then
+    log "--keep: leaving $BOX running (destroy it yourself)"
+  fi
+  exit $rc
+}
+trap cleanup EXIT
+
+if [ "$YES" = 0 ]; then
+  printf "This creates a billable EC2 instance (m7i.large ~\$0.10/h, ~30 min run). Continue? [y/N] "
+  read -r reply
+  case "$reply" in y|Y|yes) ;; *) echo "aborted"; trap - EXIT; exit 0 ;; esac
+fi
+
+# --- 1. create -------------------------------------------------------------
+log "1/9 clouddevbox new $BOX --kvm (this takes several minutes)..."
+CREATED=1
+"$CDB" new "$BOX" --kvm --profile "$PROFILE" || fail "new --kvm failed"
+
+# --- 2. status: kvm enabled + wait for full provisioning -------------------
+log "2/9 status: expecting kvm enabled, then waiting for full provisioning"
+st="$("$CDB" status "$BOX" --profile "$PROFILE")" || fail "status failed"
+echo "$st" | grep -q "kvm:       enabled" || fail "status does not show kvm enabled:
+$st"
+echo "$st" | grep -q "online" || fail "box not online on the tailnet:
+$st"
+deadline=$(( $(date +%s) + 900 ))
+until echo "$st" | grep -q "fully provisioned"; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "not fully provisioned after 15 min:
+$st"
+  echo "$st" | grep -q "FAILED" && fail "bootstrap failed:
+$st"
+  sleep 30
+  st="$("$CDB" status "$BOX" --profile "$PROFILE")" || fail "status failed"
+done
+log "box fully provisioned"
+
+# --- 3. deploy qemu ---------------------------------------------------------
+log "3/9 installing qemu-system-x86 + cpu-checker on the box"
+"$CDB" ssh "$BOX" --profile "$PROFILE" -- \
+  'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-system-x86 cpu-checker >/dev/null' \
+  || fail "apt install qemu failed"
+
+# --- 4. prove KVM works ------------------------------------------------------
+log "4/9 kvm-ok + /dev/kvm + KVM-accelerated qemu boot check"
+"$CDB" ssh "$BOX" --profile "$PROFILE" -- 'sudo kvm-ok' \
+  || fail "kvm-ok says KVM acceleration is NOT usable"
+"$CDB" ssh "$BOX" --profile "$PROFILE" -- 'test -c /dev/kvm' \
+  || fail "/dev/kvm does not exist"
+# qemu with -enable-kvm fails fast if /dev/kvm is unusable; rc 124 means it
+# ran under KVM until the timeout killed it.
+"$CDB" ssh "$BOX" --profile "$PROFILE" -- \
+  'sudo timeout 15 qemu-system-x86_64 -enable-kvm -cpu host -m 256 -display none -serial none -monitor none; test $? -eq 124' \
+  || fail "qemu -enable-kvm did not run"
+log "KVM verified: kvm-ok passes and qemu runs accelerated"
+
+# --- 5. copy round-trip ------------------------------------------------------
+log "5/9 copy round-trip"
+tmp="$(mktemp)"; tmp2="$(mktemp)"
+head -c 65536 /dev/urandom > "$tmp"
+"$CDB" copy "$tmp" "$BOX:/tmp/e2e-copy" --profile "$PROFILE" || fail "copy up failed"
+"$CDB" copy "$BOX:/tmp/e2e-copy" "$tmp2" --profile "$PROFILE" || fail "copy down failed"
+cmp -s "$tmp" "$tmp2" || fail "copied file differs after round-trip"
+rm -f "$tmp" "$tmp2"
+log "copy round-trip OK (64 KiB, checksums match)"
+
+# --- 6. tunnel ---------------------------------------------------------------
+log "6/9 tun: http.server on the box, curl through localhost:18080"
+"$CDB" ssh "$BOX" --profile "$PROFILE" -- \
+  'cd /tmp && (nohup python3 -m http.server 8000 >/dev/null 2>&1 &) && sleep 1' \
+  || fail "could not start http.server on the box"
+"$CDB" tun "$BOX" 18080 8000 --profile "$PROFILE" &
+TUN_PID=$!
+ok=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 2
+  curl -sf --max-time 5 http://localhost:18080/ >/dev/null && { ok=1; break; }
+done
+kill "$TUN_PID" 2>/dev/null; wait "$TUN_PID" 2>/dev/null; TUN_PID=""
+pkill -f "ssh.*-L 18080:127.0.0.1:8000" 2>/dev/null
+[ "$ok" = 1 ] || fail "curl through the tunnel never succeeded"
+log "tunnel OK"
+
+# --- 7. zero-ingress negative check ------------------------------------------
+log "7/9 negative check: port 22 on the public IP must NOT answer"
+pubip="$("$CDB" ssh "$BOX" --profile "$PROFILE" -- \
+  'TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60"); curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4')" \
+  || fail "could not read the public IP over IMDSv2"
+log "public IP: $pubip"
+if nc -h 2>&1 | grep -q -- '-G'; then nc -z -G 5 "$pubip" 22; else nc -z -w 5 "$pubip" 22; fi \
+  && fail "port 22 on $pubip answered - zero-ingress invariant broken!"
+log "port 22 timed out as expected (zero ingress holds)"
+
+# --- 8. kvm disable/enable cycle (the modify path) ---------------------------
+log "8/9 stop -> kvm disable -> kvm enable (modify_instance_cpu_options path)"
+"$CDB" stop "$BOX" --profile "$PROFILE" || fail "stop failed"
+"$CDB" kvm disable "$BOX" --profile "$PROFILE" || fail "kvm disable failed"
+"$CDB" status "$BOX" --profile "$PROFILE" | grep -q "kvm:       disabled" \
+  || fail "status does not show kvm disabled after kvm disable"
+"$CDB" kvm enable "$BOX" --profile "$PROFILE" || fail "kvm enable failed"
+"$CDB" status "$BOX" --profile "$PROFILE" | grep -q "kvm:       enabled" \
+  || fail "status does not show kvm enabled after kvm enable"
+log "kvm toggle cycle OK"
+
+# --- 9. teardown (trap) ------------------------------------------------------
+log "9/9 all checks passed - teardown runs via trap"
