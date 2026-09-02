@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -1227,5 +1227,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         sys.exit(130)
+    except BrokenPipeError:
+        # stdout consumer closed early (e.g. `clouddevbox status | grep -q`);
+        # point stdout at devnull so the interpreter's final flush stays quiet
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
     finally:
         _cleanup()
