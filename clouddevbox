@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -396,7 +396,8 @@ def select_profile():
     if not profiles:
         raise CliError("no AWS profiles found in ~/.aws/config or ~/.aws/credentials")
     if len(profiles) == 1:
-        print(f"using the only configured AWS profile: {profiles[0]}")
+        # stderr: `clouddevbox profile` consumers parse stdout for the bare name
+        print(f"using the only configured AWS profile: {profiles[0]}", file=sys.stderr)
         return profiles[0]
     if not sys.stdin.isatty():
         raise CliError("--profile is required when stdin is not a tty")
@@ -1001,6 +1002,8 @@ def cmd_ssh(args, session, account):
     if args.ssm:
         return cmd_ssm(args, session, account)
     target, opts = tailnet_route(args.name, args.profile)
+    if getattr(args, "tty", False):
+        opts = [*opts, "-t"]
     cmd = ["ssh", *opts, "-l", VPS_USER, target, *args.command]
     if getattr(args, "show", False):
         print("+ " + shlex.join(cmd))
@@ -1155,6 +1158,8 @@ def build_parser():
     p = sub.add_parser("ssh", parents=[common], help="ssh over the tailnet (socks proxy)")
     p.add_argument("name")
     p.add_argument("--ssm", action="store_true", help="use SSM Session Manager instead")
+    p.add_argument("-t", "--tty", action="store_true",
+                   help="force pty allocation (interactive remote commands)")
     p.add_argument("--show", action="store_true",
                    help="print the underlying ssh command before connecting")
     p.add_argument("command", nargs="*", help="optional remote command")
@@ -1201,11 +1206,20 @@ def build_parser():
     p.add_argument("name")
     p.set_defaults(fn=cmd_status)
 
+    p = sub.add_parser("profile", parents=[common],
+                       help="resolve and print the AWS profile (picker when >1 and tty); "
+                            "lets other tools delegate profile selection")
+    p.set_defaults(fn=None)
+
     return parser
 
 
 def main():
     args = build_parser().parse_args()
+    if args.cmd == "profile":
+        # resolution only - no STS/SSO round trip, stdout is just the name
+        print(args.profile or select_profile())
+        return 0
     if not args.profile:
         # subcommand hints interpolate args.profile, so fill in the selection
         args.profile = select_profile()

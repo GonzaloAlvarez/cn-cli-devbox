@@ -72,6 +72,7 @@ clouddevbox list                                      # no --profile: interactiv
 clouddevbox ssh alpha --profile personal              # tailnet, via socks proxy
 clouddevbox ssh alpha --profile personal --show       # also print the raw ssh command
 clouddevbox ssh alpha --profile personal -- uname -a
+clouddevbox ssh alpha -t --profile personal -- top    # -t/--tty: pty for interactive commands
 clouddevbox ssm alpha --profile personal              # Session Manager (break-glass)
 clouddevbox copy report.txt alpha:/tmp/ --profile personal   # scp, local -> box
 clouddevbox copy alpha:/var/log/syslog . --profile personal  # scp, box -> local
@@ -81,6 +82,10 @@ clouddevbox stop alpha --profile personal             # EBS-only cost while stop
 clouddevbox start alpha --profile personal
 clouddevbox autostop alpha 10h --profile personal     # or: 90m, off
 clouddevbox destroy alpha --profile personal          # stack + node + params, confirmed
+clouddevbox profile                                   # resolve + print the AWS profile (bullet
+                                                      # picker when >1 and tty); stdout is just
+                                                      # the name, so other tools (kora) can
+                                                      # delegate profile selection here
 ```
 
 `list`, `stop`, `start` are driven purely by EC2 instance tags

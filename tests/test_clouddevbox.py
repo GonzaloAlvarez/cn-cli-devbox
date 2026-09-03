@@ -803,3 +803,80 @@ def test_parser_kvm():
     assert args.fn is cdb.cmd_kvm_disable
     args = cdb.build_parser().parse_args(["new", "kb1", "--kvm"])
     assert args.kvm is True and args.type is None
+
+
+# ---------------------------------------------------------------------------
+# profile subcommand + ssh --tty (v1.7.0): delegation seams for kora
+# ---------------------------------------------------------------------------
+def _boom(*a, **kw):
+    raise AssertionError("must not be called")
+
+
+def test_profile_prints_given_profile(monkeypatch, capsys):
+    """`clouddevbox profile --profile p` echoes p on stdout with zero AWS work."""
+    monkeypatch.setattr(cdb.sys, "argv", ["clouddevbox", "profile", "--profile", "p"])
+    monkeypatch.setattr(cdb, "make_session", _boom)
+    monkeypatch.setattr(cdb, "select_profile", _boom)
+    assert cdb.main() == 0
+    assert capsys.readouterr().out == "p\n"
+
+
+def test_profile_delegates_to_select_profile(monkeypatch, capsys):
+    monkeypatch.setattr(cdb.sys, "argv", ["clouddevbox", "profile"])
+    monkeypatch.setattr(cdb, "make_session", _boom)
+    monkeypatch.setattr(cdb, "select_profile", lambda: "picked")
+    assert cdb.main() == 0
+    assert capsys.readouterr().out == "picked\n"
+
+
+def test_select_profile_single_message_on_stderr(monkeypatch, capsys):
+    """The single-profile notice must stay off stdout - `profile` output is parsed."""
+    monkeypatch.setattr(cdb, "_available_profiles", lambda: ["personal"])
+    assert cdb.select_profile() == "personal"
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "using the only configured AWS profile" in err
+
+
+def test_parser_profile():
+    args = cdb.build_parser().parse_args(["profile"])
+    assert args.cmd == "profile" and args.profile is None
+    args = cdb.build_parser().parse_args(["profile", "--profile", "p"])
+    assert args.profile == "p"
+
+
+def test_ssh_tty_flag(monkeypatch):
+    class _TtyArgs(_Args):
+        tty = True
+
+    ran = []
+    monkeypatch.setattr(cdb, "_SSH_KEY_CACHE", "/fake/key.pem")
+    monkeypatch.setattr(cdb, "hs_nodes", lambda: {
+        "devbox-x": {"id": "1", "online": True, "ip": "100.64.0.99",
+                     "last_seen": None}})
+    monkeypatch.setattr(cdb, "_tcp_reachable",
+                        lambda h, p, t: (h, p) == (cdb.SOCKS_HOST, cdb.SOCKS_PORT))
+    monkeypatch.setattr(cdb.subprocess, "run",
+                        lambda cmd, **kw: (ran.append(cmd),
+                                           type("R", (), {"returncode": 0})())[1])
+    try:
+        cdb.cmd_ssh(_TtyArgs(), None, None)
+    except SystemExit as e:
+        assert e.code == 0
+    assert "-t" in ran[0]
+    # default (_Args has no tty attr) stays pty-less
+    ran.clear()
+    try:
+        cdb.cmd_ssh(_Args(), None, None)
+    except SystemExit as e:
+        assert e.code == 0
+    assert "-t" not in ran[0]
+
+
+def test_parser_ssh_tty():
+    args = cdb.build_parser().parse_args(["ssh", "xb", "-t"])
+    assert args.tty is True
+    args = cdb.build_parser().parse_args(["ssh", "xb", "--tty", "--", "kora", "ssh"])
+    assert args.tty is True and args.command == ["kora", "ssh"]
+    args = cdb.build_parser().parse_args(["ssh", "xb"])
+    assert args.tty is False
