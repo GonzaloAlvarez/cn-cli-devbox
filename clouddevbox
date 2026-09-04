@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -402,7 +402,11 @@ def select_profile():
     if not sys.stdin.isatty():
         raise CliError("--profile is required when stdin is not a tty")
     from bullet import Bullet
-    picker = Bullet(
+    # bullet draws the menu on stdout and binds that stream at import, so it
+    # can't be redirected from here. Callers that need to capture the result
+    # must run this with stdout on the tty (menu visible/usable) and read the
+    # answer from `profile --out <file>` instead of capturing stdout.
+    return Bullet(
         prompt="Select AWS Profile:",
         choices=profiles,
         indent=0,
@@ -411,18 +415,7 @@ def select_profile():
         shift=0,
         bullet="→",
         pad_right=5,
-    )
-    # Draw the menu on the terminal (stderr) so stdout carries ONLY the chosen
-    # name - otherwise a caller capturing stdout (`p=$(clouddevbox profile)`,
-    # kora) also swallows bullet's redraw frames. Bullet reads keys from stdin
-    # (unaffected) and writes the menu via sys.stdout, which we point at the
-    # tty for the duration of the interaction.
-    saved = sys.stdout
-    try:
-        sys.stdout = sys.stderr
-        return picker.launch()
-    finally:
-        sys.stdout = saved
+    ).launch()
 
 
 def make_session(profile):
@@ -1218,8 +1211,11 @@ def build_parser():
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("profile", parents=[common],
-                       help="resolve and print the AWS profile (picker when >1 and tty); "
+                       help="resolve the AWS profile (picker when >1 and tty); "
                             "lets other tools delegate profile selection")
+    p.add_argument("--out", metavar="FILE",
+                   help="write the resolved profile to FILE (for callers that "
+                        "run the picker with stdout on the tty and can't capture it)")
     p.set_defaults(fn=None)
 
     return parser
@@ -1228,8 +1224,12 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     if args.cmd == "profile":
-        # resolution only - no STS/SSO round trip, stdout is just the name
-        print(args.profile or select_profile())
+        # resolution only - no STS/SSO round trip
+        prof = args.profile or select_profile()
+        if getattr(args, "out", None):
+            with open(args.out, "w") as f:
+                f.write(prof + "\n")
+        print(prof)
         return 0
     if not args.profile:
         # subcommand hints interpolate args.profile, so fill in the selection

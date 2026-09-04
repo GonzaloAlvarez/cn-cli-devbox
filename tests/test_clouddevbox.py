@@ -506,30 +506,24 @@ def test_select_profile_launches_bullet(monkeypatch):
     assert captured["choices"] == ["personal", "work"]
 
 
-def test_select_profile_menu_off_stdout(monkeypatch, capsys):
-    """The picker's redraw frames go to stderr; stdout carries ONLY the chosen
-    name, so a caller capturing stdout (`p=$(clouddevbox profile)` / kora)
-    never swallows the menu (regression: kora's pty merged the streams)."""
-    monkeypatch.setattr(cdb.sys, "stdin", _Tty())
-    monkeypatch.setattr(cdb, "_available_profiles", lambda: ["personal", "work"])
+def test_parser_profile_out():
+    args = cdb.build_parser().parse_args(["profile", "--out", "/tmp/p"])
+    assert args.cmd == "profile" and args.out == "/tmp/p"
+    args = cdb.build_parser().parse_args(["profile"])
+    assert args.out is None
 
-    class FakeBullet:
-        def __init__(self, **kw):
-            pass
 
-        def launch(self):
-            # bullet renders via sys.stdout; select_profile must have it
-            # pointed at stderr for the duration.
-            print("MENU-FRAME-personal\nMENU-FRAME-work")
-            return "work"
-
-    monkeypatch.setitem(_sys.modules, "bullet",
-                        types.SimpleNamespace(Bullet=FakeBullet))
-    assert cdb.select_profile() == "work"
-    out, err = capsys.readouterr()
-    assert "MENU-FRAME" not in out          # menu never lands on stdout
-    assert "MENU-FRAME" in err              # it went to the terminal (stderr)
-    assert cdb.sys.stdout is not cdb.sys.stderr   # restored afterwards
+def test_profile_out_writes_file(tmp_path, monkeypatch, capsys):
+    """`profile --out FILE` writes the resolved name to FILE (the seam callers
+    use when they run the picker on the tty and can't capture stdout)."""
+    out = tmp_path / "prof"
+    monkeypatch.setattr(cdb.sys, "argv",
+                        ["clouddevbox", "profile", "--profile", "work", "--out", str(out)])
+    monkeypatch.setattr(cdb, "make_session", _boom)
+    monkeypatch.setattr(cdb, "select_profile", _boom)
+    assert cdb.main() == 0
+    assert out.read_text().strip() == "work"
+    assert capsys.readouterr().out.strip() == "work"
 
 
 # ---------------------------------------------------------------------------
