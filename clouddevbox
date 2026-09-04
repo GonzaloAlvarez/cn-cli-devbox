@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 REGION = "us-east-2"
 VPS_HOST = "hs.gn.al"
@@ -402,7 +402,7 @@ def select_profile():
     if not sys.stdin.isatty():
         raise CliError("--profile is required when stdin is not a tty")
     from bullet import Bullet
-    return Bullet(
+    picker = Bullet(
         prompt="Select AWS Profile:",
         choices=profiles,
         indent=0,
@@ -411,7 +411,18 @@ def select_profile():
         shift=0,
         bullet="→",
         pad_right=5,
-    ).launch()
+    )
+    # Draw the menu on the terminal (stderr) so stdout carries ONLY the chosen
+    # name - otherwise a caller capturing stdout (`p=$(clouddevbox profile)`,
+    # kora) also swallows bullet's redraw frames. Bullet reads keys from stdin
+    # (unaffected) and writes the menu via sys.stdout, which we point at the
+    # tty for the duration of the interaction.
+    saved = sys.stdout
+    try:
+        sys.stdout = sys.stderr
+        return picker.launch()
+    finally:
+        sys.stdout = saved
 
 
 def make_session(profile):

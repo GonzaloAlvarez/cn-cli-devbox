@@ -506,6 +506,32 @@ def test_select_profile_launches_bullet(monkeypatch):
     assert captured["choices"] == ["personal", "work"]
 
 
+def test_select_profile_menu_off_stdout(monkeypatch, capsys):
+    """The picker's redraw frames go to stderr; stdout carries ONLY the chosen
+    name, so a caller capturing stdout (`p=$(clouddevbox profile)` / kora)
+    never swallows the menu (regression: kora's pty merged the streams)."""
+    monkeypatch.setattr(cdb.sys, "stdin", _Tty())
+    monkeypatch.setattr(cdb, "_available_profiles", lambda: ["personal", "work"])
+
+    class FakeBullet:
+        def __init__(self, **kw):
+            pass
+
+        def launch(self):
+            # bullet renders via sys.stdout; select_profile must have it
+            # pointed at stderr for the duration.
+            print("MENU-FRAME-personal\nMENU-FRAME-work")
+            return "work"
+
+    monkeypatch.setitem(_sys.modules, "bullet",
+                        types.SimpleNamespace(Bullet=FakeBullet))
+    assert cdb.select_profile() == "work"
+    out, err = capsys.readouterr()
+    assert "MENU-FRAME" not in out          # menu never lands on stdout
+    assert "MENU-FRAME" in err              # it went to the terminal (stderr)
+    assert cdb.sys.stdout is not cdb.sys.stderr   # restored afterwards
+
+
 # ---------------------------------------------------------------------------
 # kvm / nested virtualization (v1.6.0)
 # ---------------------------------------------------------------------------
